@@ -1,0 +1,9 @@
+log_path = "C:/"
+
+[playback]
+exclusive = false
+target_buffer_dur_ms = 0
+
+[capture]
+exclusive = false
+target_buffer_dur_ms = 0

@@ -1,0 +1,43 @@
+[package]
+name = "wasapi_relink_test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+windows = { version = "0.62.*", features = [
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_System_SystemServices",
+    "Win32_Media_Audio_DirectSound",
+] }
+log = "0.4.*"
+retour = "0.4.0-alpha.4"
+windows-core = "0.62.*"
+flexi_logger = "0.31.*"
+serde = { version = "1.*", features = ["derive"] }
+toml = "0.9.*"
+auto-allocator = "*"
+ringbuf = "0.*"
+parking_lot = "0.*"
+
+[dev-dependencies]
+openal = "0.2.2"
+openal-binds = { path = "./openal-binds" }
+simple_logger = "5.1.0"
+structured-logger = "1.0.5"
+libloading = "0.8.9"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
