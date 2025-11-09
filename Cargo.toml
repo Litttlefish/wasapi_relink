@@ -1,5 +1,5 @@
 [package]
-name = "wasapi_relink_test"
+name = "wasapi_relink"
 version = "0.1.0"
 edition = "2024"
 
@@ -17,6 +17,8 @@ windows = { version = "0.62.*", features = [
     "Win32_Devices_FunctionDiscovery",
     "Win32_System_SystemServices",
     "Win32_Media_Audio_DirectSound",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Media_DirectShow",
 ] }
 log = "0.4.*"
 retour = "0.4.0-alpha.4"
