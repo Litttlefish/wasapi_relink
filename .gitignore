@@ -1,2 +1,3 @@
 /target
-/openal-binds/target
+/openal-binds
+/OpenAL32.dll
