@@ -64,7 +64,16 @@ It is recommended to load `wasapi_relink.dll` as a Special K "plug-in" (lazy mod
 
 **Built-in Compatibility:** `wasapi_relink` actively detects and **skips** hooking Special K's own audio requests, ensuring SK's OSD sounds and other features are not affected.
 
+### Use as a Developer Library (Advanced Usage)
+An additional purpose of this tool is to act as a "proxy" library if the audio library you are using does not support `IAudioClient3` low-latency initialization.
+
+No complex injection tools are needed. Simply, early in your program’s startup, explicitly load this DLL with `LoadLibrary("wasapi_relink.dll")`. Its hooking behavior is automatically performed when the DLL is loaded, thereby "transparently" providing low-latency features to your existing audio library.
+
 ### Reminder on using stub generator
+To facilitate use with stub generators, `wasapi_relink.dll` additionally exports a blank function named `proxy`.
+
+This function does nothing on its own; it exists only as a definitive "entry point".
+
 **DO NOT use `ole32.dll` when generating DLL stubs.** Doing so can cause infinite recursion during `LoadLibrary`/COM activation and lead to unstable or hard-to-debug behavior (e.g., repeated loader calls, crashes, or the target process hanging).
 
 **Why:** `ole32.dll` is heavily involved in COM activation and in-process marshaling. Creating stubs that forward or re-export COM/ole32 entry points can easily create circular calls where the loader repeatedly invokes the same activation paths.
@@ -74,8 +83,10 @@ The configuration file `redirect_config.toml` **must** be placed in the same dir
 ```toml
 # Path for the log file. "" (empty string) defaults to the working directory.
 log_path = ""
-# Log level: Trace, Debug, Info, Warn, Error
+# Log level: Trace, Debug, Info, Warn, Error, Never
 log_level = "Info"
+# Log only to stdout (true) or to both stdout and file (false).
+only_log_stdout = false
 
 [playback]
 # Target buffer duration in 0.1ms units (u16).
@@ -93,8 +104,13 @@ compat = false
 ### Config Details
 - `log_path` (string): Where to save the log file. Default or `""` means current working directory.
 
-- `log_level` (string): `Trace`, `Debug`, `Info`, `Warn`, `Error`. Default is `Info`.  
+- `log_level` (string): `Trace`, `Debug`, `Info`, `Warn`, `Error`, `Never`. Default is `Info`.  
 **See performance warning below.**
+
+- `only_log_stdout` (bool): Controls logging targets.
+  - `true`: Logs _only_ to the standard output (stdout). No log file will be created.
+  - `false` (Default): Logs to __both__ the standard output (stdout) and the file specified by `log_path`.
+  - This option is particularly useful for developers who want to monitor logs in real-time in a terminal or for applications running in containerized environments (like Docker) where capturing stdout is the standard practice.
 
 - `[playback]`/`[capture]`: Separate configs for output and input.
 
@@ -132,6 +148,14 @@ It commonly occurs when the target executable resides under `Program Files` or o
 For example:
 ```toml
 log_path = "C:\\Users\\Public\\wasapi_relink.log"
+```
+If you don't need logging to file, you can also disable it with `only_log_stdout` :
+```toml
+only_log_stdout = false
+```
+Or, you can entirely disable logging (not recommended):
+```toml
+log_level = "Never"
 ```
 
 ## ⚠️Performance Warning: Logging & Audio Tearing

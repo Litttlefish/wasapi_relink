@@ -64,7 +64,16 @@
 
 **内置兼容性：** `wasapi_relink` 会主动检测并 **跳过** 对 Special K 自身音频请求的 hook ， 确保 SK 的 OSD 声音和其他功能不受影响。
 
+### 作为开发者库使用 (高级用法)
+本工具的一个额外用途是：如果你使用的音频库不支持 `IAudioClient3` 低延迟初始化，你可以将 `wasapi_relink` 作为一个“代理”库使用。
+
+无需使用复杂的注入工具。只需在程序启动早期，通过 `LoadLibrary("wasapi_relink.dll")` 显式加载本 DLL 即可。其 Hook 行为会在 DLL 加载时自动完成，从而“透明地”为现有的音频库提供低延迟特性。
+
 ### 关于使用stub生成器的提醒
+为了方便与stub生成器配合使用，`wasapi_relink.dll` 额外导出了一个名为 `proxy` 的空白函数。
+
+此函数本身不执行任何操作，它仅作为一个明确的“载入点”而存在。
+
 **请勿使用 `ole32.dll` 。** 这样做可能在 `LoadLibrary`/COM 激活期间导致**无限递归**，并导致不稳定或难以调试/预测的行为 (例如，重复的加载器调用、崩溃或目标进程挂起)。
 
 **原因：** `ole32.dll` 深度参与 COM 组件的操作过程。创建转发或重新导出 COM/ole32 入口点的 stub 很容易创建循环调用，导致加载器重复调用相同的激活路径。
@@ -74,7 +83,7 @@
 ```toml
 # 日志文件路径。"" (空字符串) 默认为当前工作目录。
 log_path = ""
-# 日志级别: Trace, Debug, Info, Warn, Error
+# 日志级别: Trace, Debug, Info, Warn, Error, Never
 log_level = "Info"
 
 [playback]
@@ -93,8 +102,13 @@ compat = false
 ### 配置详情
 - `log_path` (string): 保存日志文件的位置。默认或 `""` 表示当前工作目录。
 
-- `log_level` (string): `Trace`, `Debug`, `Info`, `Warn`, `Error` 。 默认是 `Info`。  
+- `log_level` (string): `Trace`, `Debug`, `Info`, `Warn`, `Error`, `Never` 。 默认是 `Info`。  
 **请参阅下面的性能警告。**
+
+- `only_log_stdout` (bool): 控制日志的输出目标。
+  - `true`: *仅*将日志输出到标准输出。不会创建任何日志文件。
+  - `false` (默认): 将日志**同时**输出到标准输出和 `log_path` 指定的文件。
+  - 此选项对于希望在终端中实时监控日志的开发者，或在容器化环境（如 Docker）中运行的应用（捕获 stdout 是标准做法）特别有用。
 
 - `[playback]`/`[capture]`: 分别配置输出和输入。
 
@@ -131,6 +145,14 @@ compat = false
 例如：
 ```toml
 log_path = "C:\\Users\\Public\\wasapi_relink.log"
+```
+如果你不需要输出到文件，也可以使用 `only_log_stdout` 关闭:
+```toml
+only_log_stdout = false
+```
+你也可以完全关闭日志输出（不推荐）:
+```toml
+log_level = "Never"
 ```
 
 ## ⚠️性能警告：日志与音频撕裂

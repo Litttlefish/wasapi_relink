@@ -9,13 +9,13 @@ use flexi_logger::*;
 use log::*;
 use retour::GenericDetour;
 use serde::*;
+use std::cell::UnsafeCell;
 use std::ops::Add;
 use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::ptr::null_mut;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
-use std::{cell::UnsafeCell, fmt::Display};
 
 use windows::{
     Win32::{
@@ -35,7 +35,7 @@ use windows::{
 //     Library::new("ole32.dll").expect("Failed to load original ole32.dll")
 // });
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
 enum ConfigLogLevel {
     Trace,
     Debug,
@@ -43,20 +43,19 @@ enum ConfigLogLevel {
     Info,
     Warn,
     Error,
+    Never,
 }
-impl Display for ConfigLogLevel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                ConfigLogLevel::Trace => "trace",
-                ConfigLogLevel::Debug => "debug",
-                ConfigLogLevel::Info => "info",
-                ConfigLogLevel::Warn => "warn",
-                ConfigLogLevel::Error => "error",
-            }
-        )
+
+impl Into<LevelFilter> for ConfigLogLevel {
+    fn into(self) -> LevelFilter {
+        match self {
+            Self::Trace => LevelFilter::Trace,
+            Self::Debug => LevelFilter::Debug,
+            Self::Info => LevelFilter::Info,
+            Self::Warn => LevelFilter::Warn,
+            Self::Error => LevelFilter::Error,
+            Self::Never => LevelFilter::Off,
+        }
     }
 }
 
@@ -73,6 +72,7 @@ enum ConfigSource {
 struct RedirectConfig {
     log_path: PathBuf,
     log_level: ConfigLogLevel,
+    only_log_stdout: bool,
     playback: ClientConfig,
     capture: ClientConfig,
     #[serde(skip)]
@@ -95,6 +95,7 @@ impl RedirectConfig {
         Self {
             log_path: PathBuf::default(),
             log_level: ConfigLogLevel::default(),
+            only_log_stdout: false,
             playback: ClientConfig::default(),
             capture: ClientConfig::default(),
             source,
@@ -1379,7 +1380,7 @@ impl IAudioRenderClient_Impl for RedirectAudioRenderClient_Impl {
 }
 
 #[unsafe(export_name = "proxy")]
-unsafe extern "system" fn proxy_dummy() {}
+unsafe extern "C" fn proxy_dummy() {}
 
 #[unsafe(no_mangle)]
 unsafe extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c_void) -> BOOL {
@@ -1394,25 +1395,32 @@ unsafe extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c
                 //     .unwrap()
                 //     .log_to_stdout()
                 //     .start();
+                let logger = Logger::with(<ConfigLogLevel as Into<LevelFilter>>::into(
+                    CONFIG.log_level,
+                ));
+                let _handle = if !CONFIG.only_log_stdout {
+                    logger
+                        .log_to_file({
+                            let spec = FileSpec::default()
+                                .basename("wasapi_relink")
+                                .suffix("log")
+                                .suppress_timestamp();
+                            if CONFIG.log_path.is_dir() {
+                                spec.directory(CONFIG.log_path.clone())
+                            } else {
+                                spec
+                            }
+                        })
+                        .duplicate_to_stdout(Duplicate::All)
+                } else {
+                    logger.log_to_stdout()
+                }
+                .start();
 
-                let _logger = Logger::try_with_str(CONFIG.log_level.to_string())
-                    .unwrap()
-                    .log_to_file({
-                        let spec = FileSpec::default()
-                            .basename("wasapi_relink")
-                            .suffix("log")
-                            .suppress_timestamp();
-                        if CONFIG.log_path.is_dir() {
-                            spec.directory(CONFIG.log_path.clone())
-                        } else {
-                            spec
-                        }
-                    })
-                    .duplicate_to_stdout(Duplicate::All)
-                    .start();
                 info!(
-                    "Attempting to load config from working directory: {:?}",
+                    "Attempting to load config from working directory: {}",
                     std::env::current_dir()
+                        .map_or_else(|_| "unknown".to_string(), |path| path.display().to_string(),)
                 );
                 match CONFIG.source {
                     ConfigSource::Success => info!("Config loaded!"),
@@ -1429,7 +1437,7 @@ unsafe extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c
             // HOOK_CO_CREATE_INSTANCE.disable().unwrap();
             HOOK_CO_CREATE_INSTANCE_EX.disable().unwrap();
         },
-        _ => {}
+        _ => (),
     };
-    BOOL::from(true)
+    true.into()
 }
