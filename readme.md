@@ -1,8 +1,6 @@
 # WASAPI Relink
 English | [中文](./readme_zh-CN.md)
 
-A lightweight COM hook for dynamically reducing WASAPI Shared-mode latency utilizing `IAudioClient3` low-latency initialization.
-
 `wasapi_relink` is a hook library that modifies the behavior of WASAPI (Windows Audio Session API) Shared streams, "grafting" them onto modern, low-latency interfaces to drastically minimize audio latency.
 
 ## 🎯Purpose

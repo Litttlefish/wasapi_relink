@@ -1,8 +1,6 @@
 # WASAPI Relink
 [English](./readme.md) | 中文
 
-一个轻量级的 COM hook 库，利用 `IAudioClient3` 的低延迟初始化，动态降低 WASAPI 共享模式的延迟。
-
 `wasapi_relink` 是一个 hook 库，它修改 WASAPI (Windows Audio Session API) 共享流的行为，将其“嫁接”到现代的低延迟接口上，以最大限度地减少音频延迟。
 
 ## 🎯目的
