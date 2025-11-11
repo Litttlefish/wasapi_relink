@@ -14,9 +14,9 @@
 你的音频驱动会报告一个支持的缓冲区范围 (即 `GetSharedModeEnginePeriod`)，`wasapi_relink` 会将请求限制在此范围内。这个问题在 Realtek 板载声卡上尤为明显，详见下文。
 
 #### Realtek 的问题
-大多数 Realtek 原厂驱动会将其缓冲区范围**完全无效**为 10ms。
+大多数 Realtek 原厂驱动会将其缓冲区范围**严格锁定**为 10ms。
 
-如果你的驱动如此， `wasapi_relink` 将**毫无效果**，因为它无法请求小于 10ms 的缓冲区。
+如果你的驱动如此， `wasapi_relink` 将**完全无效**，因为它无法请求小于 10ms 的缓冲区。
 
 #### 解决方案
 你必须**卸载 Realtek 驱动**，并强制 Windows 安装通用的 **"High Definition Audio Device" 驱动程序**。这个驱动通常允许 2ms-10ms 的范围，使得 `wasapi_relink` 能成功请求 2ms 的缓冲区。
