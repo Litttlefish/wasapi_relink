@@ -48,7 +48,7 @@
 
 2. **实例 A (诱饵)：** 以应用程序期望的常规共享模式初始化。
 
-3. **实例 B (触发器)：** 以 `IAudioClient3` 的 __低延迟模式__初始化。这是关键：它会[**触发 Windows 的特殊行为**](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/low-latency-audio#faq)，强制实际的硬件音频引擎缓冲区与此低延迟请求 (例如 2ms) 对齐。
+3. **实例 B (触发器)：** 以 `IAudioClient3` 的**低延迟模式**初始化。这是关键：它会[**触发 Windows 的特殊行为**](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/low-latency-audio#faq)，强制实际的硬件音频引擎缓冲区与此低延迟请求 (例如 2ms) 对齐。
 
 4. **预填充欺骗：** `wasapi_relink` 接着拦截应用程序的静默预填充 (Prefill) 过程，**欺骗**它填充一个与新的硬件缓冲区大小相匹配的、更小的缓冲区。
 
