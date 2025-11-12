@@ -9,7 +9,7 @@ Many applications and games use WASAPI's Shared mode for audio playback. While c
 `wasapi_relink` intercepts the application's audio requests and forces them to use much smaller buffers by leveraging the `IAudioClient3` interface, achieving a low-latency experience similar to Exclusive mode without sacrificing Shared mode's convenience.
 
 ### ❗Reminder: Your Driver is Everything
-This tool is 100% dependent on your audio driver. The target_buffer_dur_ms setting in config is a ***request***, not a *command*.
+This tool is 100% dependent on your audio driver. The `target_buffer_dur_ms` setting in config is a ***request***, not a *command*.
 
 Your audio driver reports a supported buffer range (i.e. `GetSharedModeEnginePeriod`), and `wasapi_relink` will clamp the request to fit within that range, this problem is most obvious when using Realtek onboard soundcards, see below.
 
@@ -52,7 +52,7 @@ Or, use a professional soundcard or external audio interface that supports low-l
 
 4. **Prefill Deception:** `wasapi_relink` then intercepts the application's silent prefill process, **deceiving it** into filling a much smaller buffer that matches the new hardware buffer size.
 
-**Result:** At worst, latency is double that of Normal Mode (Prefill Buffer + Device Buffer). At best, it's identical to Normal Mode.
+**Result:** At this point, the buffer requested in standard shared mode effectively acts as an intermediate buffer layer. In the worst-case scenario, latency is doubled (the sum of the pre-filled buffer and the device buffer). In the best-case scenario, it matches the latency of the standard mode.
 
 ## 🔧How to Use (Injection)
 This library **does not** include its own DLL injector. You must use an external tool or [stub generator](https://github.com/namazso/dll-proxy-generator).
