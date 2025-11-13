@@ -158,7 +158,7 @@ const LIB_NAME: PCSTR = s!("ole32.dll");
 const CO_CREATE: PCSTR = s!("CoCreateInstance");
 const CO_CREATE_EX: PCSTR = s!("CoCreateInstanceEx");
 
-const KEYWORDS: &[&str] = &["[SK]", "[GAME]"];
+const KEYWORDS: &[&str] = &["[GAME]", "[SK]"];
 
 #[allow(unused)]
 static HOOK_CO_CREATE_INSTANCE: LazyLock<GenericDetour<FnCoCreateInstance>> =
@@ -265,6 +265,7 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
 //     source: ALuint, // OpenAL 的“播放器”
 // }
 
+#[repr(transparent)]
 #[implement(IMMDeviceCollection)]
 struct RedirectDeviceCollection {
     inner: IMMDeviceCollection,
@@ -340,8 +341,8 @@ macro_rules! boilerplate {
     };
 }
 
+#[repr(transparent)]
 #[implement(IMMDevice, IMMEndpoint)]
-#[derive(Clone)]
 struct RedirectDevice {
     inner: IMMDevice,
 }
@@ -365,8 +366,7 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
             info!("RedirectDevice::Activate() called, iid: {iid:?}");
             match iid {
                 IAudioClient::IID | IAudioClient2::IID | IAudioClient3::IID => {
-                    info!("wrapping, IAudioClient");
-                    let inner = self.inner.Activate::<IAudioClient3>(
+                    let inner: IAudioClient3 = self.inner.Activate::<IAudioClient3>(
                         dwclsctx,
                         (!pactivationparams.is_null()).then_some(pactivationparams),
                     )?;
@@ -452,6 +452,7 @@ impl IMMEndpoint_Impl for RedirectDevice_Impl {
     }
 }
 
+#[repr(transparent)]
 #[implement(IPropertyStore)]
 pub struct RedirectPropertyStore {
     inner: IPropertyStore,
@@ -498,6 +499,7 @@ impl IPropertyStore_Impl for RedirectPropertyStore_Impl {
     }
 }
 
+#[repr(transparent)]
 #[implement(IMMDeviceEnumerator)]
 struct RedirectDeviceEnumerator {
     inner: IMMDeviceEnumerator,
