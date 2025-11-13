@@ -46,15 +46,15 @@ enum ConfigLogLevel {
     Never,
 }
 
-impl Into<LevelFilter> for ConfigLogLevel {
-    fn into(self) -> LevelFilter {
-        match self {
-            Self::Trace => LevelFilter::Trace,
-            Self::Debug => LevelFilter::Debug,
-            Self::Info => LevelFilter::Info,
-            Self::Warn => LevelFilter::Warn,
-            Self::Error => LevelFilter::Error,
-            Self::Never => LevelFilter::Off,
+impl From<ConfigLogLevel> for LevelFilter {
+    fn from(value: ConfigLogLevel) -> Self {
+        match value {
+            ConfigLogLevel::Trace => Self::Trace,
+            ConfigLogLevel::Debug => Self::Debug,
+            ConfigLogLevel::Info => Self::Info,
+            ConfigLogLevel::Warn => Self::Warn,
+            ConfigLogLevel::Error => Self::Error,
+            ConfigLogLevel::Never => Self::Off,
         }
     }
 }
