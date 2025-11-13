@@ -223,35 +223,37 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
             dwcount,
             presults,
         );
-        if hr.is_ok() {
-            for i in 0..dwcount as usize {
-                let p_qi = presults.add(i);
-                if (*p_qi).hr.is_ok() && *(*p_qi).pIID == IMMDeviceEnumerator::IID {
-                    debug!("CoCreateInstanceEx CLSCTX: {:?}", dwclsctx);
-                    if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
-                        && let Ok(name) = thread_desc.to_string()
-                        && KEYWORDS.iter().any(|keyword| name.contains(keyword))
-                    {
-                        info!(
-                            "Skipping SpecialK CoCreateInstanceEx calls, thread name: {}",
-                            name
-                        );
-                        continue;
-                    }
-                    info!(
-                        "!!! Intercepted IMMDeviceEnumerator via CoCreateInstanceEx, replacing with proxy !!!"
-                    );
-
-                    let proxy_enumerator: IMMDeviceEnumerator =
-                        RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(
-                            (*p_qi).pItf.take().unwrap_unchecked().into_raw(),
-                        ))
-                        .into();
-                    _ = (*p_qi).pItf.insert(proxy_enumerator.into());
-                }
+        if *clsid == MMDeviceEnumerator {
+            debug!("CoCreateInstanceEx CLSCTX: {:?}", dwclsctx);
+            if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
+                && let Ok(name) = thread_desc.to_string()
+                && !name.is_empty()
+                && KEYWORDS.iter().any(|keyword| name.contains(keyword))
+            {
+                info!(
+                    "Skipping SpecialK CoCreateInstanceEx calls, thread name: {}",
+                    name
+                );
+                return hr;
             }
-        } else {
-            error!("CoCreateInstanceEx call failed with HRESULT: {}", hr);
+            if hr.is_ok() {
+                for i in 0..dwcount as usize {
+                    let p_qi = &mut *presults.add(i);
+                    if *p_qi.pIID == IMMDeviceEnumerator::IID && p_qi.hr.is_ok() {
+                        info!(
+                            "!!! Intercepted IMMDeviceEnumerator via CoCreateInstanceEx, replacing with proxy !!!"
+                        );
+                        let proxy_enumerator: IMMDeviceEnumerator =
+                            RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(
+                                p_qi.pItf.take().unwrap_unchecked().into_raw(),
+                            ))
+                            .into();
+                        _ = p_qi.pItf.insert(proxy_enumerator.into());
+                    }
+                }
+            } else {
+                error!("CoCreateInstanceEx call failed with HRESULT: {}", hr);
+            }
         }
         hr
     }
@@ -433,7 +435,7 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
         Ok(RedirectPropertyStore::new(unsafe { self.inner.OpenPropertyStore(stgmaccess)? }).into())
     }
 
-    fn GetId(&self) -> windows::core::Result<windows::core::PWSTR> {
+    fn GetId(&self) -> windows::core::Result<PWSTR> {
         debug!("RedirectDevice::GetId() called");
         unsafe { self.inner.GetId() }
     }
@@ -967,6 +969,15 @@ struct HookerInfo {
     inner_buffer_len: u32,
     hooker_buffer_len: u32,
 }
+impl HookerInfo {
+    #[inline]
+    fn init(&mut self, inner: u32, hooker: u32, align: u16) {
+        self.hooker_buffer_len = hooker;
+        self.inner_buffer_len = inner;
+        self.align = align;
+        self.hooker_padding = inner - hooker;
+    }
+}
 
 #[implement(IAudioClient3)]
 struct RedirectCompatAudioClient {
@@ -1047,10 +1058,11 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     pformat,
                     (!audiosessionguid.is_null()).then_some(audiosessionguid),
                 )?;
-                info_ref.hooker_buffer_len = self.hooker.GetBufferSize()?;
-                info_ref.inner_buffer_len = self.inner.GetBufferSize()?;
-                info_ref.align = (*pformat).nBlockAlign;
-                info_ref.hooker_padding = info_ref.inner_buffer_len - info_ref.hooker_buffer_len;
+                info_ref.init(
+                    self.inner.GetBufferSize()?,
+                    self.hooker.GetBufferSize()?,
+                    (*pformat).nBlockAlign,
+                );
                 Ok(())
             }
         } else {
@@ -1420,7 +1432,7 @@ unsafe extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c
                 info!(
                     "Attempting to load config from working directory: {}",
                     std::env::current_dir()
-                        .map_or_else(|_| "unknown".to_string(), |path| path.display().to_string(),)
+                        .map_or_else(|_| "unknown".to_string(), |path| path.display().to_string())
                 );
                 match CONFIG.source {
                     ConfigSource::Success => info!("Config loaded!"),

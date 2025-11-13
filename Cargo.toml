@@ -1,6 +1,6 @@
 [package]
 name = "wasapi_relink"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -27,15 +27,15 @@ flexi_logger = "0.31.*"
 serde = { version = "1.*", features = ["derive"] }
 toml = "0.9.*"
 auto-allocator = "*"
-ringbuf = "0.*"
-parking_lot = "0.*"
+# ringbuf = "0.*"
+# parking_lot = "0.*"
 
 [dev-dependencies]
 # openal = "0.2.2"
 # openal-binds = { path = "./openal-binds" }
 simple_logger = "5.1.0"
 # structured-logger = "1.0.5"
-libloading = "0.8.9"
+# libloading = "0.8.9"
 
 [lib]
 crate-type = ["cdylib"]
