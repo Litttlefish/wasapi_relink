@@ -1313,8 +1313,8 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
         pformat: *const WAVEFORMATEX,
         audiosessionguid: *const GUID,
     ) -> windows::core::Result<()> {
-        info!(
-            "RedirectCompatAudioClient::InitializeSharedAudioStream() called, direction: {:?}",
+        warn!(
+            "RedirectCompatAudioClient::InitializeSharedAudioStream() called, this shouldn't happen on compat mode! direction: {:?}",
             self.dataflow
         );
         unsafe {
