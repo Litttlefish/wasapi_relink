@@ -226,8 +226,8 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
         if *clsid == MMDeviceEnumerator {
             debug!("CoCreateInstanceEx CLSCTX: {:?}", dwclsctx);
             if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
+                && !thread_desc.is_empty()
                 && let Ok(name) = thread_desc.to_string()
-                && !name.is_empty()
                 && KEYWORDS.iter().any(|keyword| name.contains(keyword))
             {
                 info!(
@@ -1318,6 +1318,12 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
             self.dataflow
         );
         unsafe {
+            self.hooker.InitializeSharedAudioStream(
+                streamflags,
+                periodinframes,
+                pformat,
+                (!audiosessionguid.is_null()).then_some(audiosessionguid),
+            )?;
             self.inner.InitializeSharedAudioStream(
                 streamflags,
                 periodinframes,
