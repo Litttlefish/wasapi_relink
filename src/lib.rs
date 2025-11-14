@@ -14,7 +14,7 @@ use std::ops::Add;
 use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::ptr::null_mut;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use windows::{
@@ -981,12 +981,19 @@ impl HookerInfo {
     }
 }
 
+#[repr(u8)]
+enum TrickState {
+    Tricking,
+    Filled,
+    Transparent,
+}
+
 #[implement(IAudioClient3)]
 struct RedirectCompatAudioClient {
     inner: IAudioClient3,
     hooker: IAudioClient3,
     dataflow: DeviceDataFlow,
-    trick: Arc<AtomicBool>,
+    trick: Arc<AtomicU8>,
     hooker_info: UnsafeCell<HookerInfo>,
 }
 
@@ -996,7 +1003,7 @@ impl RedirectCompatAudioClient {
             inner,
             hooker,
             dataflow,
-            trick: AtomicBool::new(true).into(),
+            trick: AtomicU8::default().into(),
             hooker_info: HookerInfo::default().into(),
         }
     }
@@ -1020,7 +1027,6 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
             info!("Original dur: {} * 100ns", hnsbufferduration);
             let target_cfg = CONFIG.get(self.dataflow);
             unsafe {
-                let info_ref = &mut *self.hooker_info.get();
                 let mut pdefaultperiodinframes = 0;
                 let mut pfundamentalperiodinframes = 0;
                 let mut pminperiodinframes = 0;
@@ -1060,7 +1066,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     pformat,
                     (!audiosessionguid.is_null()).then_some(audiosessionguid),
                 )?;
-                info_ref.init(
+                (&mut *self.hooker_info.get()).init(
                     self.inner.GetBufferSize()?,
                     self.hooker.GetBufferSize()?,
                     (*pformat).nBlockAlign,
@@ -1096,7 +1102,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
     }
 
     fn GetCurrentPadding(&self) -> windows::core::Result<u32> {
-        if self.trick.load(std::sync::atomic::Ordering::Acquire) {
+        if self.trick.load(Ordering::Acquire) != TrickState::Transparent as u8 {
             info!("RedirectCompatAudioClient::GetCurrentPadding() called, tricking");
             let info_ref = unsafe { &*self.hooker_info.get() };
             Ok(info_ref
@@ -1157,7 +1163,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
         );
         unsafe {
             self.trick
-                .store(false, std::sync::atomic::Ordering::Release);
+                .store(TrickState::Transparent as u8, Ordering::Release);
             self.hooker.Start()?;
             self.inner.Start()
         }
@@ -1169,7 +1175,6 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
             self.dataflow
         );
         unsafe {
-            self.trick.store(true, std::sync::atomic::Ordering::Release);
             self.hooker.Stop()?;
             self.inner.Stop()
         }
@@ -1181,7 +1186,8 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
             self.dataflow
         );
         unsafe {
-            self.trick.store(true, std::sync::atomic::Ordering::Release);
+            self.trick
+                .store(TrickState::Tricking as u8, Ordering::Release);
             self.hooker.Reset()?;
             self.inner.Reset()
         }
@@ -1324,14 +1330,13 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
 struct RedirectAudioRenderClient {
     inner: IAudioRenderClient,
     trick_buffer: UnsafeCell<Vec<u8>>,
-    trick: Arc<AtomicBool>,
-    filled: UnsafeCell<bool>,
+    trick: Arc<AtomicU8>,
     raw_hooker_len: usize,
     hooker_buffer_len: u32,
 }
 impl RedirectAudioRenderClient {
     fn new(
-        trick: Arc<AtomicBool>,
+        trick: Arc<AtomicU8>,
         inner: IAudioRenderClient,
         align: u16,
         inner_buffer_len: u32,
@@ -1341,7 +1346,6 @@ impl RedirectAudioRenderClient {
             inner,
             trick_buffer: vec![0; inner_buffer_len as usize * align as usize].into(),
             trick,
-            filled: false.into(),
             raw_hooker_len: hooker_buffer_len as usize * align as usize,
             hooker_buffer_len,
         }
@@ -1349,7 +1353,7 @@ impl RedirectAudioRenderClient {
 }
 impl IAudioRenderClient_Impl for RedirectAudioRenderClient_Impl {
     fn GetBuffer(&self, numframesrequested: u32) -> windows::core::Result<*mut u8> {
-        if self.trick.load(std::sync::atomic::Ordering::Acquire) {
+        if self.trick.load(Ordering::Acquire) != TrickState::Transparent as u8 {
             info!(
                 "RedirectAudioRenderClient::GetBuffer() called, requested: {numframesrequested}, tricking"
             );
@@ -1360,20 +1364,18 @@ impl IAudioRenderClient_Impl for RedirectAudioRenderClient_Impl {
     }
 
     fn ReleaseBuffer(&self, numframeswritten: u32, dwflags: u32) -> windows::core::Result<()> {
-        if self.trick.load(std::sync::atomic::Ordering::Acquire) {
-            info!(
-                "RedirectAudioRenderClient::ReleaseBuffer() called, written: {numframeswritten}, tricking"
-            );
-            if unsafe { *self.filled.get() } {
-                info!("already filled, discarding");
-                Ok(())
-            } else {
+        match unsafe { std::mem::transmute(self.trick.load(Ordering::Acquire)) } {
+            TrickState::Tricking => {
+                info!(
+                    "RedirectAudioRenderClient::ReleaseBuffer() called, written: {numframeswritten}, tricking"
+                );
                 unsafe {
                     info!(
                         "filling silent buffer, {} samples filled",
                         self.hooker_buffer_len
                     );
-                    *self.filled.get() = true;
+                    self.trick
+                        .store(TrickState::Filled as u8, Ordering::Release);
                     let slice_to_write = std::slice::from_raw_parts_mut(
                         self.inner.GetBuffer(self.hooker_buffer_len)?,
                         self.raw_hooker_len,
@@ -1383,12 +1385,13 @@ impl IAudioRenderClient_Impl for RedirectAudioRenderClient_Impl {
                     self.inner.ReleaseBuffer(self.hooker_buffer_len, dwflags)
                 }
             }
-        } else {
-            if unsafe { *self.filled.get() } {
-                info!("resetting filled marker");
-                unsafe { *self.filled.get() = false };
+            TrickState::Filled => {
+                info!("already filled, discarding");
+                Ok(())
             }
-            unsafe { self.inner.ReleaseBuffer(numframeswritten, dwflags) }
+            TrickState::Transparent => unsafe {
+                self.inner.ReleaseBuffer(numframeswritten, dwflags)
+            },
         }
     }
 }
