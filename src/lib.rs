@@ -1195,8 +1195,10 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
 
     fn SetEventHandle(&self, eventhandle: HANDLE) -> windows::core::Result<()> {
         info!("RedirectCompatAudioClient::SetEventHandle() called");
-        unsafe { self.hooker.SetEventHandle(eventhandle)? }
-        unsafe { self.inner.SetEventHandle(eventhandle) }
+        unsafe {
+            self.hooker.SetEventHandle(eventhandle)?;
+            self.inner.SetEventHandle(eventhandle)
+        }
     }
 
     fn GetService(&self, riid: *const GUID, ppv: *mut *mut c_void) -> windows::core::Result<()> {
