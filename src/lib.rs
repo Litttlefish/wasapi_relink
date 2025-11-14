@@ -1366,7 +1366,7 @@ impl IAudioRenderClient_Impl for RedirectAudioRenderClient_Impl {
     }
 
     fn ReleaseBuffer(&self, numframeswritten: u32, dwflags: u32) -> windows::core::Result<()> {
-        match unsafe { std::mem::transmute(self.trick.load(Ordering::Acquire)) } {
+        match unsafe { std::mem::transmute::<u8, TrickState>(self.trick.load(Ordering::Acquire)) } {
             TrickState::Tricking => {
                 info!(
                     "RedirectAudioRenderClient::ReleaseBuffer() called, written: {numframeswritten}, tricking"
