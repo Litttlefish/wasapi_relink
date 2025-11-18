@@ -10,6 +10,8 @@ use log::*;
 use retour::GenericDetour;
 use serde::*;
 use std::cell::UnsafeCell;
+use std::hint::unreachable_unchecked;
+use std::num::NonZero;
 use std::ops::Add;
 use std::os::raw::c_void;
 use std::path::PathBuf;
@@ -579,13 +581,13 @@ impl From<EDataFlow> for DeviceDataFlow {
         match value.0 {
             0 => Self::Playback,
             1 => Self::Capture,
-            _ => unreachable!(),
+            _ => unsafe { unreachable_unchecked() },
         }
     }
 }
 
-const fn calculate_buffer(sample_rate: u32, fundamental: u32, target: u16) -> u32 {
-    sample_rate * target as u32 / 10000 / fundamental * fundamental
+fn calculate_buffer(sample_rate: u32, fundamental: NonZero<u32>, target: u16) -> u32 {
+    sample_rate * target as u32 / 10000 / fundamental * fundamental.get()
 }
 
 // fn calculate_period(sample_rate: u32, buffer_len: u32) -> i64 {
@@ -670,7 +672,7 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
                 let calculated_len = if target_cfg.target_buffer_dur_ms != 0 {
                     calculate_buffer(
                         (*pformat).nSamplesPerSec,
-                        pfundamentalperiodinframes,
+                        NonZero::new_unchecked(pfundamentalperiodinframes),
                         target_cfg.target_buffer_dur_ms,
                     )
                     .clamp(pminperiodinframes, pmaxperiodinframes)
@@ -1041,7 +1043,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                 let calculated_len = if target_cfg.target_buffer_dur_ms != 0 {
                     calculate_buffer(
                         (*pformat).nSamplesPerSec,
-                        pfundamentalperiodinframes,
+                        NonZero::new_unchecked(pfundamentalperiodinframes),
                         target_cfg.target_buffer_dur_ms,
                     )
                     .clamp(pminperiodinframes, pmaxperiodinframes)
