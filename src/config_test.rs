@@ -39,11 +39,9 @@ fn test_property_store_and_audio_client() -> Result<()> {
 
     // 3. 枚举所有活动设备
     println!("\n--- Testing Enum ---");
-    let collection = unsafe {
-        proxy_enumerator
-            .into_outer()
-            .EnumAudioEndpoints(windows::Win32::Media::Audio::eAll, DEVICE_STATE_ACTIVE)?
-    };
+    let collection = proxy_enumerator
+        .into_outer()
+        .EnumAudioEndpoints(windows::Win32::Media::Audio::eAll, DEVICE_STATE_ACTIVE)?;
 
     // --- 测试 1: IPropertyStore ---
     println!("\n--- Testing IPropertyStore ---");
@@ -56,7 +54,7 @@ fn test_property_store_and_audio_client() -> Result<()> {
         let friendly_name_key = PKEY_Device_FriendlyName;
         let name_variant = unsafe { prop_store.GetValue(&friendly_name_key)? };
 
-        let name = unsafe { name_variant.to_string() };
+        let name = name_variant.to_string();
         println!("Device Friendly Name from Proxy: {}", name);
 
         // --- 测试 2: IAudioClient ---
@@ -155,24 +153,22 @@ fn test_cocreateinstance_ex_hook() {
 
         // 这里可以添加更多检查来验证它确实是我们的代理
         println!("\n--- Testing Enum ---");
-        let collection = unsafe {
-            enumerator
-                .EnumAudioEndpoints(windows::Win32::Media::Audio::eAll, DEVICE_STATE_ACTIVE)
-                .unwrap()
-        };
+        let collection = enumerator
+            .EnumAudioEndpoints(windows::Win32::Media::Audio::eAll, DEVICE_STATE_ACTIVE)
+            .unwrap();
 
         // --- 测试 1: IPropertyStore ---
         println!("\n--- Testing IPropertyStore ---");
         let devices = find_redirected_device(&collection).unwrap();
         for device in devices {
             // 激活 IPropertyStore
-            let prop_store = unsafe { device.OpenPropertyStore(STGM_READ).unwrap() };
+            let prop_store = device.OpenPropertyStore(STGM_READ).unwrap();
 
             // 获取设备友好名称
             let friendly_name_key = PKEY_Device_FriendlyName;
-            let name_variant = unsafe { prop_store.GetValue(&friendly_name_key).unwrap() };
+            let name_variant = prop_store.GetValue(&friendly_name_key).unwrap();
 
-            let name = unsafe { name_variant.to_string() };
+            let name = name_variant.to_string();
             println!("Device Friendly Name from Proxy: {}", name);
         }
 
