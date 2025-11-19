@@ -24,7 +24,7 @@ use windows::{
         Media::Audio::{DirectSound::*, Endpoints::*, *},
         Media::DirectShow::*,
         System::Com::{StructuredStorage::*, *},
-        System::LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryA},
+        System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
         System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH},
         System::Threading::{GetCurrentThread, GetThreadDescription},
         UI::Shell::PropertiesSystem::{IPropertyStore, IPropertyStore_Impl},
@@ -71,7 +71,7 @@ enum ConfigSource {
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct RedirectConfig {
-    log_path: PathBuf,
+    log_path: Option<PathBuf>,
     log_level: ConfigLogLevel,
     only_log_stdout: bool,
     playback: ClientConfig,
@@ -94,12 +94,8 @@ impl RedirectConfig {
     #[inline]
     fn new_with_source(source: ConfigSource) -> Self {
         Self {
-            log_path: PathBuf::default(),
-            log_level: ConfigLogLevel::default(),
-            only_log_stdout: false,
-            playback: ClientConfig::default(),
-            capture: ClientConfig::default(),
             source,
+            ..Self::default()
         }
     }
     fn get(&self, dataflow: DeviceDataFlow) -> &ClientConfig {
@@ -155,7 +151,7 @@ type FnCoCreateInstanceEx = unsafe extern "system" fn(
 // }
 // static GLOBAL_AL: Mutex<Arc<OpenALGlobal>> = Mutex::new();
 
-const LIB_NAME: PCSTR = s!("ole32.dll");
+const LIB_NAME: PCWSTR = w!("ole32.dll");
 const CO_CREATE: PCSTR = s!("CoCreateInstance");
 const CO_CREATE_EX: PCSTR = s!("CoCreateInstanceEx");
 
@@ -164,7 +160,11 @@ const KEYWORDS: &[&str] = &["[GAME]", "[SK]"];
 #[allow(unused)]
 static HOOK_CO_CREATE_INSTANCE: LazyLock<GenericDetour<FnCoCreateInstance>> =
     LazyLock::new(|| unsafe {
-        let func = GetProcAddress(GetModuleHandleA(LIB_NAME).unwrap(), CO_CREATE).unwrap();
+        let func = GetProcAddress(
+            GetModuleHandleW(LIB_NAME).unwrap_or_else(|_| LoadLibraryW(LIB_NAME).unwrap()),
+            CO_CREATE,
+        )
+        .unwrap();
         let func: FnCoCreateInstance = std::mem::transmute(func);
         GenericDetour::new(func, hooked_cocreateinstance).unwrap()
     });
@@ -172,7 +172,7 @@ static HOOK_CO_CREATE_INSTANCE: LazyLock<GenericDetour<FnCoCreateInstance>> =
 static HOOK_CO_CREATE_INSTANCE_EX: LazyLock<GenericDetour<FnCoCreateInstanceEx>> =
     LazyLock::new(|| unsafe {
         let func = GetProcAddress(
-            GetModuleHandleA(LIB_NAME).unwrap_or(LoadLibraryA(LIB_NAME).unwrap()),
+            GetModuleHandleW(LIB_NAME).unwrap_or_else(|_| LoadLibraryW(LIB_NAME).unwrap()),
             CO_CREATE_EX,
         )
         .unwrap();
@@ -585,7 +585,7 @@ impl From<EDataFlow> for DeviceDataFlow {
     }
 }
 
-fn calculate_buffer(sample_rate: u32, fundamental: u32, target: u16) -> u32 {
+const fn calculate_buffer(sample_rate: u32, fundamental: u32, target: u16) -> u32 {
     sample_rate * target as u32 / 10000 / fundamental * fundamental
 }
 
@@ -1429,10 +1429,11 @@ unsafe extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c
                         .log_to_file({
                             let spec = FileSpec::default()
                                 .basename("wasapi_relink")
-                                .suffix("log")
                                 .suppress_timestamp();
-                            if CONFIG.log_path.is_dir() {
-                                spec.directory(CONFIG.log_path.clone())
+                            if let Some(path) = &CONFIG.log_path
+                                && path.is_dir()
+                            {
+                                spec.directory(path)
                             } else {
                                 spec
                             }
