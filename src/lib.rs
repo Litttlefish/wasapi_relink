@@ -15,6 +15,7 @@ use std::ops::Add;
 use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::ptr::null_mut;
+use std::slice::from_raw_parts_mut;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock};
 
@@ -172,7 +173,10 @@ static HOOK_CO_CREATE_INSTANCE: LazyLock<GenericDetour<FnCoCreateInstance>> =
 static HOOK_CO_CREATE_INSTANCE_EX: LazyLock<GenericDetour<FnCoCreateInstanceEx>> =
     LazyLock::new(|| unsafe {
         let func = GetProcAddress(
-            GetModuleHandleW(LIB_NAME).unwrap_or_else(|_| LoadLibraryW(LIB_NAME).unwrap()),
+            GetModuleHandleW(LIB_NAME).unwrap_or_else(|e| {
+                warn!("Unable to find ole32.dll handle, err: {e}, loading");
+                LoadLibraryW(LIB_NAME).unwrap()
+            }),
             CO_CREATE_EX,
         )
         .unwrap();
@@ -224,7 +228,7 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
             dwcount,
             presults,
         );
-        if *clsid == MMDeviceEnumerator {
+        if *clsid == MMDeviceEnumerator && hr.is_ok() {
             debug!("CoCreateInstanceEx CLSCTX: {:?}", dwclsctx);
             if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
                 && !thread_desc.is_empty()
@@ -234,27 +238,24 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
                 info!(
                     "Skipping SpecialK CoCreateInstanceEx calls, thread name: {}",
                     name
-                );
-                return hr;
-            }
-            if hr.is_ok() {
-                for i in 0..dwcount as usize {
-                    let p_qi = &mut *presults.add(i);
-                    if *p_qi.pIID == IMMDeviceEnumerator::IID && p_qi.hr.is_ok() {
+                )
+            } else {
+                for qi in from_raw_parts_mut(presults, dwcount as usize) {
+                    if *qi.pIID == IMMDeviceEnumerator::IID && qi.hr.is_ok() {
                         info!(
                             "!!! Intercepted IMMDeviceEnumerator via CoCreateInstanceEx, replacing with proxy !!!"
                         );
                         let proxy_enumerator: IMMDeviceEnumerator =
                             RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(
-                                p_qi.pItf.take().unwrap_unchecked().into_raw(),
+                                qi.pItf.take().unwrap_unchecked().into_raw(),
                             ))
                             .into();
-                        _ = p_qi.pItf.insert(proxy_enumerator.into());
+                        _ = qi.pItf.insert(proxy_enumerator.into())
                     }
                 }
-            } else {
-                error!("CoCreateInstanceEx call failed with HRESULT: {}", hr);
             }
+        } else {
+            error!("CoCreateInstanceEx call failed with HRESULT: {}", hr)
         }
         hr
     }
@@ -1062,7 +1063,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                 self.inner.Initialize(
                     sharemode,
                     streamflags,
-                    10000,
+                    0,
                     hnsperiodicity,
                     pformat,
                     (!audiosessionguid.is_null()).then_some(audiosessionguid),
@@ -1385,7 +1386,7 @@ impl IAudioRenderClient_Impl for RedirectAudioRenderClient_Impl {
                     );
                     self.trick
                         .store(TrickState::Filled as u8, Ordering::Release);
-                    let slice_to_write = std::slice::from_raw_parts_mut(
+                    let slice_to_write = from_raw_parts_mut(
                         self.inner.GetBuffer(self.hooker_buffer_len)?,
                         self.raw_hooker_len,
                     );
@@ -1446,8 +1447,10 @@ unsafe extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c
 
                 info!(
                     "Attempting to load config from working directory: {}",
-                    std::env::current_dir()
-                        .map_or_else(|_| "unknown".to_string(), |path| path.display().to_string())
+                    std::env::current_dir().map_or_else(
+                        |e| format!("unknown, err: {e}"),
+                        |path| path.display().to_string()
+                    )
                 );
                 match CONFIG.source {
                     ConfigSource::Success => info!("Config loaded!"),
