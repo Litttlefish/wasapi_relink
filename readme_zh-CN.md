@@ -4,7 +4,7 @@
 `wasapi_relink` 是一个 hook 库，它修改 WASAPI (Windows Audio Session API) 共享流的行为，将其“嫁接”到现代的低延迟接口上，以最大限度地减少音频延迟。
 
 ## 🎯目的
-许多应用程序和游戏使用 WASAPI 共享模式播放音频。虽然兼容性好，但此模式默认 10ms 的大缓冲区，导致了明显的高延迟。
+许多应用程序和游戏使用 WASAPI 共享模式播放音频。虽然兼容性好，但此模式最小只能使用 10ms 的缓冲区，导致延迟表现无法继续改善。
 
 `wasapi_relink` 拦截应用程序的音频请求，并利用 `IAudioClient3` 接口强制它们使用更小的缓冲区，在不牺牲共享模式便利性的前提下，实现接近独占模式的低延迟体验。
 
@@ -19,7 +19,7 @@
 如果你的驱动如此， `wasapi_relink` 将**完全无效**，因为它无法请求小于 10ms 的缓冲区。
 
 #### 解决方案
-你必须**卸载 Realtek 驱动**，并强制 Windows 安装通用的 **"High Definition Audio Device" 驱动程序**。这个驱动通常允许 2ms-10ms 的范围，使得 `wasapi_relink` 能成功请求 2ms 的缓冲区。
+你必须**卸载 Realtek 驱动**，并强制 Windows 安装通用的 **"High Definition Audio Device"** 驱动程序。这个驱动通常允许 2ms-10ms 的范围，使得 `wasapi_relink` 能成功请求 2ms 的缓冲区。
 
 条件允许的话，你也可以使用支持低延迟的专业声卡或外置音频接口。
 
@@ -27,7 +27,7 @@
 `wasapi_relink` 以两种不同模式运行，以处理不同类型的应用程序。
 
 ### 普通模式 (适用于事件驱动型应用)
-**目标：** 使用事件驱动 (基于回调) 音频流的现代应用程序和游戏。
+**目标：** 使用事件驱动 (基于回调) 音频流的应用程序和游戏。
 
 **方法：**
 
@@ -46,13 +46,15 @@
 
 1. Hook `IMMDevice::Activate` 并创建**两个** `IAudioClient3` 实例。
 
-2. **实例 A (诱饵)：** 以应用程序期望的常规共享模式初始化。
+2. **实例 A (透明代理)：** 以应用程序期望的常规共享模式初始化。
 
-3. **实例 B (触发器)：** 以 `IAudioClient3` 的**低延迟模式**初始化。这是关键：它会[**触发 Windows 的特殊行为**](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/low-latency-audio#faq)，强制实际的硬件音频引擎缓冲区与此低延迟请求 (例如 2ms) 对齐。
+3. **实例 B (锚点实例)：** 以 `IAudioClient3` 的**低延迟模式**初始化，它会[**触发 Windows 的特殊行为**](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/low-latency-audio#faq)，强制实际的硬件音频引擎缓冲区与此这个请求 (例如 2ms) 对齐。
 
-4. **预填充欺骗：** `wasapi_relink` 接着拦截应用程序的静默预填充 (Prefill) 过程，**欺骗**它填充一个与新的硬件缓冲区大小相匹配的、更小的缓冲区。
+4. **预填充欺骗：** 接下来 `wasapi_relink` 会拦截应用程序的静默预填充 (Prefill) 过程，**欺骗**它填充一个与新的硬件缓冲区大小相匹配的、更小的缓冲区。
 
-**结果：** 此时，常规共享模式申请的buffer可以等效于一个中间缓冲层。最差情况下，延迟是普通模式的两倍 (预填充缓冲区 + 设备缓冲区)。最佳情况下，与普通模式一致。
+**结果：** 此时，常规共享模式申请的缓冲区可以等效于一个中间层。
+- **最差情况：** 延迟是普通模式的两倍 (预填充缓冲区 + 设备缓冲区)。
+- **最佳情况：** 与普通模式一致。
 
 ## 🔧如何使用 (注入)
 本工具**不包含**自己的 DLL 注入器。你必须使用外部工具或[ stub 生成器](https://github.com/namazso/dll-proxy-generator)。
@@ -62,10 +64,10 @@
 
 推荐将 `wasapi_relink.dll` 作为 Special K 的“插件” (plug-in) ，以 lazy mode 加载。
 
-**内置兼容性：** `wasapi_relink` 会主动检测并 **跳过** 对 Special K 自身音频请求的 hook ， 确保 SK 的 OSD 声音和其他功能不受影响。
+**内置兼容性：** `wasapi_relink` 会主动检测并 **跳过** 对 Special K 自身音频请求的 hook ， 确保 SK 的音频相关功能不受影响。
 
 ### 作为开发者库使用 (高级用法)
-本工具的一个额外用途是：如果你使用的音频库不支持 `IAudioClient3` 低延迟初始化，你可以将 `wasapi_relink` 作为一个“代理”库使用。
+本工具的一个额外用途是：如果你使用的音频库不支持 `IAudioClient3` 低延迟初始化，你可以将 `wasapi_relink` 作为一个“辅助”库使用。
 
 无需使用复杂的注入工具。只需在程序启动早期，通过 `LoadLibrary("wasapi_relink.dll")` 显式加载本 DLL 即可。其 Hook 行为会在 DLL 加载时自动完成，从而“透明地”为现有的音频库提供低延迟特性。
 
@@ -100,7 +102,7 @@ compat = false
 ```
 
 ### 配置详情
-- `log_path` (string): 保存日志文件的位置。默认或 `""` 表示当前工作目录。
+- `log_path` (string): 保存日志文件的位置。非路径值表示当前工作目录。
 
 - `log_level` (string): `Trace`, `Debug`, `Info`, `Warn`, `Error`, `Never` 。 默认是 `Info`。  
 **请参阅下面的性能警告。**
@@ -112,7 +114,7 @@ compat = false
 
 - `[playback]`/`[capture]`: 分别配置输出和输入。
 
-  - `target_buffer_dur_ms` (u16): 目标缓冲区大小，单位为 **0.1 毫秒**。如果设置过低或未指定，将默认为驱动的最小值。**除非遇到音频爆音，否则通常不应更改此值。**
+  - `target_buffer_dur_ms` (u16): 目标缓冲区大小，单位为 **0.1 毫秒**。如果设置过低或未指定，将默认为驱动的最小值。**除非遇到音频爆音，否则通常不应设置此值。**
 
   - `compat` (bool): 强制此流使用**兼容**模式。
 
@@ -170,9 +172,9 @@ Windows 音频引擎对时序 _极其_ 敏感。
 ### “外部低延迟”的误解
 以前的工具([REAL](https://github.com/miniant-git/REAL), [LowAudioLatency](https://github.com/spddl/LowAudioLatency) 及类似项目) 试图通过在后台运行一个单独的低延迟 `IAudioClient3` 应用程序/线程来解决此问题。
 
- - **没问题的部分：** 正如 Windows FAQ 所述，这*确实*会触发 Windows 的特殊行为，并*强制*硬件缓冲区为所有应用切换到更小尺寸。
+ - **没问题的部分：** 正如 Windows FAQ 所述，这*确实*会触发 Windows 的特殊行为，并*强制*所有应用切换到更小尺寸的硬件缓冲区。
 
- - **被忽视的部分：** 他们假设降低硬件缓冲区就够用了。**但事实并非如此。** 一个轮询驱动的应用程序*仍然*会尝试静默预填充 (Prefill) 其旧的 10ms 缓冲区。延迟瓶颈只是从硬件转移到了应用程序自己的预填充上。
+ - **被忽视的部分：** 他们假设更改硬件缓冲区就够用了。**但事实并非如此。** 轮询驱动的应用程序*仍然*会尝试静默预填充 (Prefill) 其旧的 10ms 缓冲区。延迟瓶颈只是从硬件转移到了应用程序自己的预填充上。
 
 `wasapi_relink` 的**兼容模式***同时*解决了这两个问题：它触发了硬件变更，并从内部 hook 应用程序，以*欺骗*和*修改*其静默预填充行为来匹配新的、更小的硬件缓冲区。
 
@@ -181,7 +183,7 @@ Windows 音频引擎对时序 _极其_ 敏感。
 
 1. Hook `CoCreateInstanceEx`.
 
-2. 当应用请求 `CLSID_MMDeviceEnumerator` (主音频设备枚举器) `时，wasapi_relink` 创建真实对象，并向应用返回一个**带有包装层**的 `IMMDeviceEnumerator`。
+2. 当应用请求 `CLSID_MMDeviceEnumerator` (主音频设备枚举器) 时， `wasapi_relink` 创建真实对象，并向应用返回一个**带有包装层**的 `IMMDeviceEnumerator`。
 
 3. 当应用在这个组件上请求设备时， `wasapi_relink` 返回一个包装的 `IMMDevice` 。
 
@@ -189,7 +191,7 @@ Windows 音频引擎对时序 _极其_ 敏感。
 
     3.2.**普通模式：** 当应用在包装的 `IAudioClient` 上调用 `Initialize` 时，将执行普通模式的逻辑。
 
-4. 这条包装链一直延续到 `IAudioRenderClient`，使 `wasapi_relink` 能够完全、透明地控制整个音频流的生命周期。
+4. 这条包装链一直延续到 `IAudioRenderClient` (兼容模式)，使 `wasapi_relink` 能够完全、透明地控制整个音频流的生命周期。
 
 ### 关于捕获 (麦克风) 的说明
 在**兼容模式**下，捕获 (麦克风) 流只会简单转发。这是*有意为之*：

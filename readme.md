@@ -4,7 +4,7 @@ English | [中文](./readme_zh-CN.md)
 `wasapi_relink` is a hook library that modifies the behavior of WASAPI (Windows Audio Session API) Shared streams, "grafting" them onto modern, low-latency interfaces to drastically minimize audio latency.
 
 ## 🎯Purpose
-Many applications and games use WASAPI's Shared mode for audio playback. While compatible, this mode defaults to a large 10ms buffer, creating noticeable, high-latency audio.
+Many applications and games use WASAPI's Shared mode for audio playback. While it offers good compatibility, this mode only allows for a minimum buffer size of 10ms, preventing further improvement in latency.
 
 `wasapi_relink` intercepts the application's audio requests and forces them to use much smaller buffers by leveraging the `IAudioClient3` interface, achieving a low-latency experience similar to Exclusive mode without sacrificing Shared mode's convenience.
 
@@ -27,7 +27,7 @@ Or, use a professional soundcard or external audio interface that supports low-l
 `wasapi_relink` operates in two distinct modes to handle different types of applications.
 
 ### Normal Mode (For Event-Driven Apps)
-**Target:** Modern applications and games that use event-driven (callback-based) audio streaming.
+**Target:** Applications and games that use event-driven (callback-based) audio streaming.
 
 **Method:**
 
@@ -46,13 +46,15 @@ Or, use a professional soundcard or external audio interface that supports low-l
 
 1. Hooks `IMMDevice::Activate` and creates **two** `IAudioClient3` instances.
 
-2. **Instance A (The "Decoy"):** Is initialized in a regular Shared mode that the application expects.
+2. **Instance A (Transparent):** Is initialized in a regular Shared mode that the application expects.
 
-3. **Instance B (The "Hooker"):** Is initialized in `IAudioClient3`'s __low-latency mode__. This is the key: it [**triggers a special Windows behavior**](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/low-latency-audio#faq) that forces the actual hardware audio engine buffer to align with this low-latency request (e.g. 2ms).
+3. **Instance B (Hooker):** Is initialized in `IAudioClient3`'s __low-latency mode__. This is the key: it [**triggers a special Windows behavior**](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/low-latency-audio#faq) that forces the actual hardware audio engine buffer to align with this low-latency request (e.g. 2ms).
 
 4. **Prefill Deception:** `wasapi_relink` then intercepts the application's silent prefill process, **deceiving it** into filling a much smaller buffer that matches the new hardware buffer size.
 
-**Result:** At this point, the buffer requested in standard shared mode effectively acts as an intermediate buffer layer. In the worst-case scenario, latency is doubled (the sum of the pre-filled buffer and the device buffer). In the best-case scenario, it matches the latency of the standard mode.
+**Result:** At this point, the buffer requested in standard shared mode effectively acts as an intermediate buffer layer.
+- **Worst-case:** Latency is doubled comparing to normal mode (the sum of the pre-filled buffer and the device buffer).
+- **Best-case:** Latency is identical to the normal mode.
 
 ## 🔧How to Use (Injection)
 This library **does not** include its own DLL injector. You must use an external tool or [stub generator](https://github.com/namazso/dll-proxy-generator).
@@ -62,10 +64,10 @@ This library is designed to work seamlessly with **Special K**.
 
 It is recommended to load `wasapi_relink.dll` as a Special K "plug-in" (lazy mode).
 
-**Built-in Compatibility:** `wasapi_relink` actively detects and **skips** hooking Special K's own audio requests, ensuring SK's OSD sounds and other features are not affected.
+**Built-in Compatibility:** `wasapi_relink` actively detects and **skips** hooking Special K's own audio requests, ensuring SK's sound related features are not affected.
 
 ### Use as a Developer Library (Advanced Usage)
-An additional purpose of this tool is to act as a "proxy" library if the audio library you are using does not support `IAudioClient3` low-latency initialization.
+An additional purpose of this tool is to act as a "auxiliary" library if the audio library you are using does not support `IAudioClient3` low-latency initialization.
 
 No complex injection tools are needed. Simply, early in your program’s startup, explicitly load this DLL with `LoadLibrary("wasapi_relink.dll")`. Its hooking behavior is automatically performed when the DLL is loaded, thereby "transparently" providing low-latency features to your existing audio library.
 
@@ -102,7 +104,7 @@ compat = false
 ```
 
 ### Config Details
-- `log_path` (string): Where to save the log file. Default or `""` means current working directory.
+- `log_path` (string): Where to save the log file. Non-directory value means current working directory.
 
 - `log_level` (string): `Trace`, `Debug`, `Info`, `Warn`, `Error`, `Never`. Default is `Info`.  
 **See performance warning below.**
@@ -114,7 +116,7 @@ compat = false
 
 - `[playback]`/`[capture]`: Separate configs for output and input.
 
-  - `target_buffer_dur_ms` (u16): The target buffer size in **units of 0.1 milliseconds**. The tool will default to the driver's minimum if this is set too low or not specified. **You should generally not change this from the default low value unless you experience audio pops.**
+  - `target_buffer_dur_ms` (u16): The target buffer size in **units of 0.1 milliseconds**. The tool will default to the driver's minimum if this is set too low or not specified. **You should generally not change this from the default value unless you experience audio pops.**
 
   - `compat` (bool): Forces this stream to use **Compat Mode**.
 
