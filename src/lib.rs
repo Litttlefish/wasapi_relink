@@ -368,20 +368,17 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
             info!("RedirectDevice::Activate() called, iid: {iid:?}");
             match iid {
                 IAudioClient::IID | IAudioClient2::IID | IAudioClient3::IID => {
-                    let inner: IAudioClient3 = self.inner.Activate::<IAudioClient3>(
-                        dwclsctx,
-                        (!pactivationparams.is_null()).then_some(pactivationparams),
-                    )?;
+                    let inner: IAudioClient3 = self
+                        .inner
+                        .Activate::<IAudioClient3>(dwclsctx, Some(pactivationparams))?;
                     let dataflow = self.inner.cast::<IMMEndpoint>()?.GetDataFlow()?.into();
                     let proxy_unknown: IAudioClient3 = if !CONFIG.get(dataflow).compat {
                         RedirectAudioClient::new(inner, dataflow).into()
                     } else {
                         RedirectCompatAudioClient::new(
                             inner,
-                            self.inner.Activate::<IAudioClient3>(
-                                dwclsctx,
-                                (!pactivationparams.is_null()).then_some(pactivationparams),
-                            )?,
+                            self.inner
+                                .Activate::<IAudioClient3>(dwclsctx, Some(pactivationparams))?,
                             dataflow,
                         )
                         .into()
@@ -390,29 +387,23 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
                 }
                 IAudioSessionManager::IID | IAudioSessionManager2::IID => assign(
                     ppinterface,
-                    self.inner.Activate::<IAudioSessionManager2>(
-                        dwclsctx,
-                        (!pactivationparams.is_null()).then_some(pactivationparams),
-                    )?,
+                    self.inner
+                        .Activate::<IAudioSessionManager2>(dwclsctx, Some(pactivationparams))?,
                 ),
                 IDirectSound::IID | IDirectSound8::IID => {
                     error!("The program is using DSound, tool won't work!");
                     assign(
                         ppinterface,
-                        self.inner.Activate::<IDirectSound8>(
-                            dwclsctx,
-                            (!pactivationparams.is_null()).then_some(pactivationparams),
-                        )?,
+                        self.inner
+                            .Activate::<IDirectSound8>(dwclsctx, Some(pactivationparams))?,
                     )
                 }
                 IDirectSoundCapture::IID => {
                     error!("The program is using DSound, tool won't work!");
                     assign(
                         ppinterface,
-                        self.inner.Activate::<IDirectSoundCapture>(
-                            dwclsctx,
-                            (!pactivationparams.is_null()).then_some(pactivationparams),
-                        )?,
+                        self.inner
+                            .Activate::<IDirectSoundCapture>(dwclsctx, Some(pactivationparams))?,
                     )
                 }
                 iid => boilerplate!(
@@ -420,7 +411,7 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
                     ppinterface,
                     self,
                     dwclsctx,
-                    (!pactivationparams.is_null()).then_some(pactivationparams),
+                    Some(pactivationparams),
                     [
                         IAudioEndpointVolume,
                         IAudioMeterInformation,
@@ -689,7 +680,7 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
                     streamflags,
                     calculated_len,
                     pformat,
-                    (!audiosessionguid.is_null()).then_some(audiosessionguid),
+                    Some(audiosessionguid),
                 )
             }
         } else {
@@ -700,7 +691,7 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
                     hnsbufferduration,
                     hnsperiodicity,
                     pformat,
-                    (!audiosessionguid.is_null()).then_some(audiosessionguid),
+                    Some(audiosessionguid),
                 )
             }
         }
@@ -733,11 +724,8 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
     ) -> windows::core::HRESULT {
         debug!("RedirectAudioClient::IsFormatSupported() called");
         unsafe {
-            self.inner.IsFormatSupported(
-                sharemode,
-                pformat,
-                (!ppclosestmatch.is_null()).then_some(ppclosestmatch),
-            )
+            self.inner
+                .IsFormatSupported(sharemode, pformat, Some(ppclosestmatch))
         }
     }
 
@@ -759,10 +747,8 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
             self.dataflow
         );
         unsafe {
-            self.inner.GetDevicePeriod(
-                (!phnsdefaultdeviceperiod.is_null()).then_some(phnsdefaultdeviceperiod),
-                (!phnsminimumdeviceperiod.is_null()).then_some(phnsminimumdeviceperiod),
-            )
+            self.inner
+                .GetDevicePeriod(Some(phnsdefaultdeviceperiod), Some(phnsminimumdeviceperiod))
         }
         // let mut returned_default = 0;
         // unsafe {
@@ -960,7 +946,7 @@ impl IAudioClient3_Impl for RedirectAudioClient_Impl {
                 streamflags,
                 periodinframes,
                 pformat,
-                (!audiosessionguid.is_null()).then_some(audiosessionguid),
+                Some(audiosessionguid),
             )
         }
     }
@@ -1058,7 +1044,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     streamflags,
                     calculated_len,
                     pformat,
-                    (!audiosessionguid.is_null()).then_some(audiosessionguid),
+                    Some(audiosessionguid),
                 )?;
                 self.inner.Initialize(
                     sharemode,
@@ -1066,7 +1052,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     0,
                     hnsperiodicity,
                     pformat,
-                    (!audiosessionguid.is_null()).then_some(audiosessionguid),
+                    Some(audiosessionguid),
                 )?;
                 (&mut *self.hooker_info.get()).init(
                     self.inner.GetBufferSize()?,
@@ -1083,7 +1069,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     hnsbufferduration,
                     hnsperiodicity,
                     pformat,
-                    (!audiosessionguid.is_null()).then_some(audiosessionguid),
+                    Some(audiosessionguid),
                 )
             }
         }
@@ -1125,11 +1111,8 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
     ) -> HRESULT {
         debug!("RedirectCompatAudioClient::IsFormatSupported() called");
         unsafe {
-            self.inner.IsFormatSupported(
-                sharemode,
-                pformat,
-                (!ppclosestmatch.is_null()).then_some(ppclosestmatch),
-            )
+            self.inner
+                .IsFormatSupported(sharemode, pformat, Some(ppclosestmatch))
         }
     }
 
@@ -1151,10 +1134,8 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
             self.dataflow
         );
         unsafe {
-            self.inner.GetDevicePeriod(
-                (!phnsdefaultdeviceperiod.is_null()).then_some(phnsdefaultdeviceperiod),
-                (!phnsminimumdeviceperiod.is_null()).then_some(phnsminimumdeviceperiod),
-            )
+            self.inner
+                .GetDevicePeriod(Some(phnsdefaultdeviceperiod), Some(phnsminimumdeviceperiod))
         }
     }
 
@@ -1324,13 +1305,13 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
                 streamflags,
                 periodinframes,
                 pformat,
-                (!audiosessionguid.is_null()).then_some(audiosessionguid),
+                Some(audiosessionguid),
             )?;
             self.inner.InitializeSharedAudioStream(
                 streamflags,
                 periodinframes,
                 pformat,
-                (!audiosessionguid.is_null()).then_some(audiosessionguid),
+                Some(audiosessionguid),
             )
         }
     }
@@ -1407,7 +1388,7 @@ impl IAudioRenderClient_Impl for RedirectAudioRenderClient_Impl {
 }
 
 #[unsafe(export_name = "proxy")]
-unsafe extern "C" fn proxy_dummy() {}
+extern "C" fn proxy_dummy() {}
 
 #[unsafe(no_mangle)]
 unsafe extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c_void) -> BOOL {
