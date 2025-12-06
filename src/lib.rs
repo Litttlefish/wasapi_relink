@@ -941,10 +941,34 @@ impl IAudioClient3_Impl for RedirectAudioClient_Impl {
             "RedirectAudioClient::InitializeSharedAudioStream() called, direction: {:?}",
             self.dataflow
         );
+        let target_cfg = CONFIG.get(self.dataflow);
+        let calculated_len = if target_cfg.target_buffer_dur_ms != 0 {
+            let mut pdefaultperiodinframes = 0;
+            let mut pfundamentalperiodinframes = 0;
+            let mut pminperiodinframes = 0;
+            let mut pmaxperiodinframes = 0;
+            unsafe {
+                self.inner.GetSharedModeEnginePeriod(
+                    pformat,
+                    &mut pdefaultperiodinframes,
+                    &mut pfundamentalperiodinframes,
+                    &mut pminperiodinframes,
+                    &mut pmaxperiodinframes,
+                )?
+            };
+            calculate_buffer(
+                unsafe { *pformat }.nSamplesPerSec,
+                pfundamentalperiodinframes,
+                target_cfg.target_buffer_dur_ms,
+            )
+            .clamp(pminperiodinframes, pmaxperiodinframes)
+        } else {
+            periodinframes
+        };
         unsafe {
             self.inner.InitializeSharedAudioStream(
                 streamflags,
-                periodinframes,
+                calculated_len,
                 pformat,
                 Some(audiosessionguid),
             )
@@ -1300,16 +1324,40 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
             "RedirectCompatAudioClient::InitializeSharedAudioStream() called, this shouldn't happen on compat mode! direction: {:?}",
             self.dataflow
         );
+        let target_cfg = CONFIG.get(self.dataflow);
+        let calculated_len = if target_cfg.target_buffer_dur_ms != 0 {
+            let mut pdefaultperiodinframes = 0;
+            let mut pfundamentalperiodinframes = 0;
+            let mut pminperiodinframes = 0;
+            let mut pmaxperiodinframes = 0;
+            unsafe {
+                self.inner.GetSharedModeEnginePeriod(
+                    pformat,
+                    &mut pdefaultperiodinframes,
+                    &mut pfundamentalperiodinframes,
+                    &mut pminperiodinframes,
+                    &mut pmaxperiodinframes,
+                )?
+            };
+            calculate_buffer(
+                unsafe { *pformat }.nSamplesPerSec,
+                pfundamentalperiodinframes,
+                target_cfg.target_buffer_dur_ms,
+            )
+            .clamp(pminperiodinframes, pmaxperiodinframes)
+        } else {
+            periodinframes
+        };
         unsafe {
             self.hooker.InitializeSharedAudioStream(
                 streamflags,
-                periodinframes,
+                calculated_len,
                 pformat,
                 Some(audiosessionguid),
             )?;
             self.inner.InitializeSharedAudioStream(
                 streamflags,
-                periodinframes,
+                calculated_len,
                 pformat,
                 Some(audiosessionguid),
             )
