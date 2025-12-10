@@ -263,12 +263,6 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
     }
 }
 
-// struct OpenALState {
-//     device: *mut ALCdevice,
-//     context: *mut ALCcontext,
-//     source: ALuint, // OpenAL 的“播放器”
-// }
-
 #[repr(transparent)]
 #[implement(IMMDeviceCollection)]
 struct RedirectDeviceCollection {
@@ -599,23 +593,10 @@ struct RedirectAudioClient {
     inner: IAudioClient3,
     // inner_info: UnsafeCell<InnerInfo>,
     dataflow: DeviceDataFlow,
-    // oal_device: *mut ALCdevice,
-    // oal_context: Option<ALCcontext>,
 }
 
 impl RedirectAudioClient {
     fn new(inner: IAudioClient3, dataflow: DeviceDataFlow) -> Self {
-        // let oal_device = {
-        //     let prop = unsafe { imm_device.GetId().unwrap() };
-        //     let oal_name = CString::new(unsafe { prop.to_string() }.unwrap()).unwrap();
-        //     unsafe { alcOpenDevice(oal_name.as_ptr() as _) }
-        // };
-        // Self {
-        //     inner,
-        //     device,
-        //     oal_device,
-        //     oal_context: None,
-        // }
         Self {
             inner,
             // inner_info: InnerInfo::default().into(),
@@ -638,13 +619,6 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
             "RedirectAudioClient::Initialize() -> redirecting to Low Latency Shared, direction: {:?}",
             self.dataflow
         );
-        // let mut attr = Vec::<ALCint>::new();
-        // let format = unsafe { *pformat };
-        // attr.push(ALC_FREQUENCY as i32);
-        // attr.push(format.nSamplesPerSec as i32);
-        // attr.push(ALC_FREQUENCY as i32);
-        // attr.push(format.nSamplesPerSec as i32);
-        // let oal_context = unsafe { alcCreateContext(self.oal_device, attrlist) };
         if sharemode == AUDCLNT_SHAREMODE_SHARED {
             info!("Original dur: {} * 100ns", hnsbufferduration);
             let target_cfg = CONFIG.get(self.dataflow);
