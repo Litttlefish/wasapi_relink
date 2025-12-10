@@ -228,29 +228,31 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
             dwcount,
             presults,
         );
-        if *clsid == MMDeviceEnumerator && hr.is_ok() {
-            debug!("CoCreateInstanceEx CLSCTX: {:?}", dwclsctx);
-            if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
-                && !thread_desc.is_empty()
-                && let Ok(name) = thread_desc.to_string()
-                && KEYWORDS.iter().any(|keyword| name.contains(keyword))
-            {
-                info!(
-                    "Skipping SpecialK CoCreateInstanceEx calls, thread name: {}",
-                    name
-                )
-            } else {
-                for qi in from_raw_parts_mut(presults, dwcount as usize) {
-                    if *qi.pIID == IMMDeviceEnumerator::IID && qi.hr.is_ok() {
-                        info!(
-                            "!!! Intercepted IMMDeviceEnumerator via CoCreateInstanceEx, replacing with proxy !!!"
-                        );
-                        let proxy_enumerator: IMMDeviceEnumerator =
-                            RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(
-                                qi.pItf.take().unwrap_unchecked().into_raw(),
-                            ))
-                            .into();
-                        _ = qi.pItf.insert(proxy_enumerator.into())
+        if hr.is_ok() {
+            if *clsid == MMDeviceEnumerator {
+                debug!("CoCreateInstanceEx CLSCTX: {:?}", dwclsctx);
+                if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
+                    && !thread_desc.is_empty()
+                    && let Ok(name) = thread_desc.to_string()
+                    && KEYWORDS.iter().any(|keyword| name.contains(keyword))
+                {
+                    info!(
+                        "Skipping SpecialK CoCreateInstanceEx calls, thread name: {}",
+                        name
+                    )
+                } else {
+                    for qi in from_raw_parts_mut(presults, dwcount as usize) {
+                        if *qi.pIID == IMMDeviceEnumerator::IID && qi.hr.is_ok() {
+                            info!(
+                                "!!! Intercepted IMMDeviceEnumerator via CoCreateInstanceEx, replacing with proxy !!!"
+                            );
+                            let proxy_enumerator: IMMDeviceEnumerator =
+                                RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(
+                                    qi.pItf.take().unwrap_unchecked().into_raw(),
+                                ))
+                                .into();
+                            _ = qi.pItf.insert(proxy_enumerator.into())
+                        }
                     }
                 }
             }
