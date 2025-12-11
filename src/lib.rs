@@ -14,7 +14,6 @@ use std::hint::unreachable_unchecked;
 use std::ops::Add;
 use std::os::raw::c_void;
 use std::path::PathBuf;
-use std::ptr::null_mut;
 use std::slice::from_raw_parts_mut;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock};
@@ -158,11 +157,13 @@ const CO_CREATE_EX: PCSTR = s!("CoCreateInstanceEx");
 
 const KEYWORDS: &[&str] = &["[GAME]", "[SK]"];
 
-#[allow(unused)]
 static HOOK_CO_CREATE_INSTANCE: LazyLock<GenericDetour<FnCoCreateInstance>> =
     LazyLock::new(|| unsafe {
         let func = GetProcAddress(
-            GetModuleHandleW(LIB_NAME).unwrap_or_else(|_| LoadLibraryW(LIB_NAME).unwrap()),
+            GetModuleHandleW(LIB_NAME).unwrap_or_else(|e| {
+                warn!("Unable to find ole32.dll handle, err: {e}, loading");
+                LoadLibraryW(LIB_NAME).unwrap()
+            }),
             CO_CREATE,
         )
         .unwrap();
@@ -192,22 +193,32 @@ unsafe extern "system" fn hooked_cocreateinstance(
     ppv: *mut *mut c_void,
 ) -> HRESULT {
     unsafe {
+        let ret = HOOK_CO_CREATE_INSTANCE.call(rclsid, p_outer, dwcls_context, riid, ppv);
         if *riid == IMMDeviceEnumerator::IID {
-            info!(
-                "!!! Intercepted IMMDeviceEnumerator creation via CoCreateInstance, returning proxy !!!"
-            );
-            let mut inner_raw: *mut c_void = null_mut();
-            let ret =
-                HOOK_CO_CREATE_INSTANCE.call(rclsid, p_outer, dwcls_context, riid, &mut inner_raw);
             if ret.is_ok() {
-                let proxy_enumerator: IMMDeviceEnumerator =
-                    RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(inner_raw)).into();
-                *ppv = proxy_enumerator.into_raw();
+                debug!("CoCreateInstance CLSCTX: {dwcls_context:?}");
+                if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
+                    && !thread_desc.is_empty()
+                    && let Ok(name) = thread_desc.to_string()
+                    && KEYWORDS.iter().any(|keyword| name.contains(keyword))
+                {
+                    info!("Skipping SpecialK CoCreateInstance calls, thread name: {name}");
+                } else {
+                    info!(
+                        "!!! Intercepted IMMDeviceEnumerator creation via CoCreateInstance, returning proxy !!!"
+                    );
+                    if ret.is_ok() {
+                        let proxy_enumerator: IMMDeviceEnumerator =
+                            RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(*ppv))
+                                .into();
+                        *ppv = proxy_enumerator.into_raw();
+                    }
+                }
+            } else {
+                error!("CoCreateInstance call failed with HRESULT: {ret}")
             }
-            ret
-        } else {
-            HOOK_CO_CREATE_INSTANCE.call(rclsid, p_outer, dwcls_context, riid, ppv)
         }
+        ret
     }
 }
 
@@ -230,16 +241,13 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
         );
         if *clsid == MMDeviceEnumerator {
             if hr.is_ok() {
-                debug!("CoCreateInstanceEx CLSCTX: {:?}", dwclsctx);
+                debug!("CoCreateInstanceEx CLSCTX: {dwclsctx:?}");
                 if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
                     && !thread_desc.is_empty()
                     && let Ok(name) = thread_desc.to_string()
                     && KEYWORDS.iter().any(|keyword| name.contains(keyword))
                 {
-                    info!(
-                        "Skipping SpecialK CoCreateInstanceEx calls, thread name: {}",
-                        name
-                    )
+                    info!("Skipping SpecialK CoCreateInstanceEx calls, thread name: {name}")
                 } else {
                     for qi in from_raw_parts_mut(presults, dwcount as usize) {
                         if *qi.pIID == IMMDeviceEnumerator::IID && qi.hr.is_ok() {
@@ -256,7 +264,7 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
                     }
                 }
             } else {
-                error!("CoCreateInstanceEx call failed with HRESULT: {}", hr)
+                error!("CoCreateInstanceEx call failed with HRESULT: {hr}")
             }
         }
         hr
@@ -1419,7 +1427,7 @@ unsafe extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c
     match reason {
         DLL_PROCESS_ATTACH => {
             unsafe {
-                // HOOK_CO_CREATE_INSTANCE.enable().unwrap();
+                HOOK_CO_CREATE_INSTANCE.enable().unwrap();
                 HOOK_CO_CREATE_INSTANCE_EX.enable().unwrap();
             };
             std::thread::spawn(|| {
@@ -1469,7 +1477,7 @@ unsafe extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c
             });
         }
         DLL_PROCESS_DETACH => unsafe {
-            // HOOK_CO_CREATE_INSTANCE.disable().unwrap();
+            HOOK_CO_CREATE_INSTANCE.disable().unwrap();
             HOOK_CO_CREATE_INSTANCE_EX.disable().unwrap();
         },
         _ => (),
