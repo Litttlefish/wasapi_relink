@@ -228,8 +228,8 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
             dwcount,
             presults,
         );
-        if hr.is_ok() {
-            if *clsid == MMDeviceEnumerator {
+        if *clsid == MMDeviceEnumerator {
+            if hr.is_ok() {
                 debug!("CoCreateInstanceEx CLSCTX: {:?}", dwclsctx);
                 if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
                     && !thread_desc.is_empty()
@@ -255,9 +255,9 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
                         }
                     }
                 }
+            } else {
+                error!("CoCreateInstanceEx call failed with HRESULT: {}", hr)
             }
-        } else {
-            error!("CoCreateInstanceEx call failed with HRESULT: {}", hr)
         }
         hr
     }
