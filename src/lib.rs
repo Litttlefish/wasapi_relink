@@ -157,30 +157,28 @@ const CO_CREATE_EX: PCSTR = s!("CoCreateInstanceEx");
 
 const KEYWORDS: &[&str] = &["[GAME]", "[SK]"];
 
+#[repr(transparent)]
+struct ModuleHandle(HMODULE);
+unsafe impl Send for ModuleHandle {}
+unsafe impl Sync for ModuleHandle {}
+
+static OLE32_LIB: LazyLock<ModuleHandle> = LazyLock::new(|| unsafe {
+    ModuleHandle(GetModuleHandleW(LIB_NAME).unwrap_or_else(|e| {
+        warn!("Unable to find ole32.dll handle, err: {e}, loading");
+        LoadLibraryW(LIB_NAME).unwrap()
+    }))
+});
+
 static HOOK_CO_CREATE_INSTANCE: LazyLock<GenericDetour<FnCoCreateInstance>> =
     LazyLock::new(|| unsafe {
-        let func = GetProcAddress(
-            GetModuleHandleW(LIB_NAME).unwrap_or_else(|e| {
-                warn!("Unable to find ole32.dll handle, err: {e}, loading");
-                LoadLibraryW(LIB_NAME).unwrap()
-            }),
-            CO_CREATE,
-        )
-        .unwrap();
+        let func = GetProcAddress(OLE32_LIB.0, CO_CREATE).unwrap();
         let func: FnCoCreateInstance = std::mem::transmute(func);
         GenericDetour::new(func, hooked_cocreateinstance).unwrap()
     });
 
 static HOOK_CO_CREATE_INSTANCE_EX: LazyLock<GenericDetour<FnCoCreateInstanceEx>> =
     LazyLock::new(|| unsafe {
-        let func = GetProcAddress(
-            GetModuleHandleW(LIB_NAME).unwrap_or_else(|e| {
-                warn!("Unable to find ole32.dll handle, err: {e}, loading");
-                LoadLibraryW(LIB_NAME).unwrap()
-            }),
-            CO_CREATE_EX,
-        )
-        .unwrap();
+        let func = GetProcAddress(OLE32_LIB.0, CO_CREATE_EX).unwrap();
         let func: FnCoCreateInstanceEx = std::mem::transmute(func);
         GenericDetour::new(func, hooked_cocreateinstanceex).unwrap()
     });
@@ -1185,8 +1183,10 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
     }
 
     fn SetEventHandle(&self, eventhandle: HANDLE) -> windows::core::Result<()> {
-        info!("RedirectCompatAudioClient::SetEventHandle() called");
+        warn!("RedirectCompatAudioClient::SetEventHandle() called, you shouldn't use compat mode!");
         unsafe {
+            self.trick
+                .store(TrickState::Transparent as u8, Ordering::Release);
             self.hooker.SetEventHandle(eventhandle)?;
             self.inner.SetEventHandle(eventhandle)
         }
