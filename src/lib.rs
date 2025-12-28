@@ -205,12 +205,9 @@ unsafe extern "system" fn hooked_cocreateinstance(
                     info!(
                         "!!! Intercepted IMMDeviceEnumerator creation via CoCreateInstance, returning proxy !!!"
                     );
-                    if ret.is_ok() {
-                        let proxy_enumerator: IMMDeviceEnumerator =
-                            RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(*ppv))
-                                .into();
-                        *ppv = proxy_enumerator.into_raw();
-                    }
+                    let proxy_enumerator: IMMDeviceEnumerator =
+                        RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(*ppv)).into();
+                    *ppv = proxy_enumerator.into_raw();
                 }
             } else {
                 error!("CoCreateInstance call failed with HRESULT: {ret}")
