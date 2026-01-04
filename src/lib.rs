@@ -157,28 +157,21 @@ const CO_CREATE_EX: PCSTR = s!("CoCreateInstanceEx");
 
 const KEYWORDS: &[&str] = &["[GAME]", "[SK]"];
 
-#[repr(transparent)]
-struct ModuleHandle(HMODULE);
-unsafe impl Send for ModuleHandle {}
-unsafe impl Sync for ModuleHandle {}
-
-static OLE32_LIB: LazyLock<ModuleHandle> = LazyLock::new(|| unsafe {
-    ModuleHandle(GetModuleHandleW(LIB_NAME).unwrap_or_else(|e| {
-        warn!("Unable to find ole32.dll handle, err: {e}, loading");
-        LoadLibraryW(LIB_NAME).unwrap()
-    }))
-});
+#[inline]
+unsafe fn get_ole32() -> HMODULE {
+    unsafe { GetModuleHandleW(LIB_NAME).unwrap_or_else(|_| LoadLibraryW(LIB_NAME).unwrap()) }
+}
 
 static HOOK_CO_CREATE_INSTANCE: LazyLock<GenericDetour<FnCoCreateInstance>> =
     LazyLock::new(|| unsafe {
-        let func = GetProcAddress(OLE32_LIB.0, CO_CREATE).unwrap();
+        let func = GetProcAddress(get_ole32(), CO_CREATE).unwrap();
         let func: FnCoCreateInstance = std::mem::transmute(func);
         GenericDetour::new(func, hooked_cocreateinstance).unwrap()
     });
 
 static HOOK_CO_CREATE_INSTANCE_EX: LazyLock<GenericDetour<FnCoCreateInstanceEx>> =
     LazyLock::new(|| unsafe {
-        let func = GetProcAddress(OLE32_LIB.0, CO_CREATE_EX).unwrap();
+        let func = GetProcAddress(get_ole32(), CO_CREATE_EX).unwrap();
         let func: FnCoCreateInstanceEx = std::mem::transmute(func);
         GenericDetour::new(func, hooked_cocreateinstanceex).unwrap()
     });
@@ -284,10 +277,7 @@ impl IMMDeviceCollection_Impl for RedirectDeviceCollection_Impl {
     }
 
     fn Item(&self, ndevice: u32) -> windows::core::Result<IMMDevice> {
-        debug!(
-            "RedirectDeviceCollection::Item() -> wrapping, device {}",
-            ndevice
-        );
+        debug!("RedirectDeviceCollection::Item() -> wrapping, device {ndevice}");
         Ok(RedirectDevice::new(unsafe { self.inner.Item(ndevice)? }).into())
     }
 }
@@ -507,10 +497,7 @@ impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
         dataflow: EDataFlow,
         dwstatemask: DEVICE_STATE,
     ) -> windows::core::Result<IMMDeviceCollection> {
-        debug!(
-            "RedirectDeviceEnumerator::EnumAudioEndpoints() -> wrapping, flow: {:?}",
-            dataflow
-        );
+        debug!("RedirectDeviceEnumerator::EnumAudioEndpoints() -> wrapping, flow: {dataflow:?}");
         Ok(RedirectDeviceCollection::new(unsafe {
             self.inner.EnumAudioEndpoints(dataflow, dwstatemask)?
         })
@@ -523,8 +510,7 @@ impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
         role: ERole,
     ) -> windows::core::Result<IMMDevice> {
         debug!(
-            "RedirectDeviceEnumerator::GetDefaultAudioEndpoint() -> wrapping, flow: {:?}",
-            dataflow
+            "RedirectDeviceEnumerator::GetDefaultAudioEndpoint() -> wrapping, flow: {dataflow:?}"
         );
         Ok(
             RedirectDevice::new(unsafe { self.inner.GetDefaultAudioEndpoint(dataflow, role)? })
@@ -580,21 +566,20 @@ const fn calculate_buffer(sample_rate: u32, fundamental: u32, target: u16) -> u3
     sample_rate * target as u32 / 10000 / fundamental * fundamental
 }
 
-// fn calculate_period(sample_rate: u32, buffer_len: u32) -> i64 {
-//     (buffer_len as i64 * 10000000) / sample_rate as i64
-// }
+const fn calculate_period(sample_rate: u32, buffer_len: u32) -> i64 {
+    (buffer_len as i64 * 10000000) / sample_rate as i64
+}
 
-// #[derive(Default)]
-// struct InnerInfo {
-//     current_buffer_len: u32,
-//     samplerate: u32,
-//     min_len: u32,
-// }
+#[derive(Default)]
+struct InnerInfo {
+    current_buffer_len: u32,
+    samplerate: u32,
+}
 
 #[implement(IAudioClient3)]
 struct RedirectAudioClient {
     inner: IAudioClient3,
-    // inner_info: UnsafeCell<InnerInfo>,
+    inner_info: UnsafeCell<InnerInfo>,
     dataflow: DeviceDataFlow,
 }
 
@@ -602,7 +587,7 @@ impl RedirectAudioClient {
     fn new(inner: IAudioClient3, dataflow: DeviceDataFlow) -> Self {
         Self {
             inner,
-            // inner_info: InnerInfo::default().into(),
+            inner_info: InnerInfo::default().into(),
             dataflow,
         }
     }
@@ -623,11 +608,11 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
             self.dataflow
         );
         if sharemode == AUDCLNT_SHAREMODE_SHARED {
-            info!("Original dur: {} * 100ns", hnsbufferduration);
+            info!("Original dur: {hnsbufferduration} * 100ns");
             let target_cfg = CONFIG.get(self.dataflow);
             unsafe {
-                // let info_ref = &mut *self.inner_info.get();
-                // info_ref.samplerate = (*pformat).nSamplesPerSec;
+                let info_ref = &mut *self.inner_info.get();
+                info_ref.samplerate = (*pformat).nSamplesPerSec;
                 let mut pdefaultperiodinframes = 0;
                 let mut pfundamentalperiodinframes = 0;
                 let mut pminperiodinframes = 0;
@@ -641,7 +626,7 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
                 )?;
                 let calculated_len = if target_cfg.target_buffer_dur_ms != 0 {
                     calculate_buffer(
-                        (*pformat).nSamplesPerSec,
+                        info_ref.samplerate,
                         pfundamentalperiodinframes,
                         target_cfg.target_buffer_dur_ms,
                     )
@@ -649,12 +634,8 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
                 } else {
                     pminperiodinframes
                 };
-                // info_ref.current_buffer_len = calculated_len;
-                // info_ref.min_len = pminperiodinframes;
-                info!(
-                    "Current period = {}, Min period = {}",
-                    calculated_len, pminperiodinframes
-                );
+                info_ref.current_buffer_len = calculated_len;
+                info!("Current period = {calculated_len}, Min period = {pminperiodinframes}");
                 self.inner.InitializeSharedAudioStream(
                     streamflags,
                     calculated_len,
@@ -678,10 +659,7 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
 
     fn GetBufferSize(&self) -> windows::core::Result<u32> {
         let buf = unsafe { self.inner.GetBufferSize()? };
-        info!(
-            "RedirectAudioClient::GetBufferSize() called, buffer length: {}",
-            buf
-        );
+        info!("RedirectAudioClient::GetBufferSize() called, buffer length: {buf}");
         Ok(buf)
     }
 
@@ -713,7 +691,10 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
             "RedirectAudioClient::GetMixFormat() called, direction: {:?}",
             self.dataflow
         );
-        unsafe { self.inner.GetMixFormat() }
+        let pformat = unsafe { self.inner.GetMixFormat()? };
+        let info_ref = unsafe { &mut *self.inner_info.get() };
+        info_ref.samplerate = unsafe { *pformat }.nSamplesPerSec;
+        Ok(pformat)
     }
 
     fn GetDevicePeriod(
@@ -725,69 +706,51 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
             "RedirectAudioClient::GetDevicePeriod() called, direction: {:?}",
             self.dataflow
         );
+        let mut minimumdeviceperiod = 0;
         unsafe {
             self.inner
-                .GetDevicePeriod(Some(phnsdefaultdeviceperiod), Some(phnsminimumdeviceperiod))
+                .GetDevicePeriod(None, Some(&mut minimumdeviceperiod))?
+        };
+        let info_ref = unsafe { &mut *self.inner_info.get() };
+        if info_ref.current_buffer_len == 0 {
+            warn!("Called before initialize, inserting parameters");
+            let target_cfg = CONFIG.get(self.dataflow);
+            let mut pdefaultperiodinframes = 0;
+            let mut pfundamentalperiodinframes = 0;
+            let mut pminperiodinframes = 0;
+            let mut pmaxperiodinframes = 0;
+            unsafe {
+                self.inner.GetSharedModeEnginePeriod(
+                    self.inner.GetMixFormat()?,
+                    &mut pdefaultperiodinframes,
+                    &mut pfundamentalperiodinframes,
+                    &mut pminperiodinframes,
+                    &mut pmaxperiodinframes,
+                )?
+            };
+            info_ref.current_buffer_len = if target_cfg.target_buffer_dur_ms != 0 {
+                calculate_buffer(
+                    info_ref.samplerate,
+                    pfundamentalperiodinframes,
+                    target_cfg.target_buffer_dur_ms,
+                )
+                .clamp(pminperiodinframes, pmaxperiodinframes)
+            } else {
+                pminperiodinframes
+            };
         }
-        // let mut returned_default = 0;
-        // unsafe {
-        //     self.inner.GetDevicePeriod(
-        //         Some(&mut returned_default),
-        //         (!phnsminimumdeviceperiod.is_null()).then_some(phnsminimumdeviceperiod),
-        //     )?
-        // }
-        // let target_cfg = CONFIG.get(self.dataflow);
-        // if (unsafe { *self.samplerate.get() }) == 0 {
-        //     warn!("Called before initialize, inserting parameters");
-
-        //     unsafe {
-        //         let pformat = self.inner.GetMixFormat()?;
-        //         *UnsafeCell::raw_get(&self.samplerate) = (*pformat).nSamplesPerSec;
-
-        //         let mut pdefaultperiodinframes = 0;
-        //         let mut pfundamentalperiodinframes = 0;
-        //         let mut pminperiodinframes = 0;
-        //         let mut pmaxperiodinframes = 0;
-        //         self.inner.GetSharedModeEnginePeriod(
-        //             pformat,
-        //             &mut pdefaultperiodinframes,
-        //             &mut pfundamentalperiodinframes,
-        //             &mut pminperiodinframes,
-        //             &mut pmaxperiodinframes,
-        //         )?;
-
-        //         let calculated_len = if target_cfg.target_buffer_dur_ms != 0 {
-        //             calculate_buffer(
-        //                 *UnsafeCell::get(&self.samplerate),
-        //                 pfundamentalperiodinframes,
-        //                 target_cfg.target_buffer_dur_ms,
-        //             )
-        //             .clamp(pminperiodinframes, pmaxperiodinframes)
-        //         } else {
-        //             pminperiodinframes
-        //         };
-        //         *UnsafeCell::raw_get(&self.current_buffer_len) = calculated_len;
-        //         *UnsafeCell::raw_get(&self.min_len) = pminperiodinframes;
-        //     };
-        // }
-        // if let Some(ptr) = unsafe { phnsdefaultdeviceperiod.as_mut() } {
-        //     info!("original phnsdefaultdeviceperiod: {}", returned_default);
-        //     let dur =
-        //         unsafe { calculate_period(*self.samplerate.get(), *self.current_buffer_len.get()) };
-        //     // if target_cfg.dur_modifier > 1 {
-        //     //     if target_cfg.inverse {
-        //     //         dur *= target_cfg.dur_modifier as i64
-        //     //     } else {
-        //     //         dur /= target_cfg.dur_modifier as i64
-        //     //     }
-        //     // }
-        //     *ptr = dur;
-        //     info!("phnsdefaultdeviceperiod: {}", ptr);
-        // }
-        // if let Some(ptr) = unsafe { phnsminimumdeviceperiod.as_ref() } {
-        //     info!("phnsminimumdeviceperiod: {}", ptr);
-        // }
-        // Ok(())
+        if !phnsdefaultdeviceperiod.is_null() {
+            unsafe {
+                *phnsdefaultdeviceperiod =
+                    calculate_period(info_ref.samplerate, info_ref.current_buffer_len)
+                        .max(minimumdeviceperiod)
+            }
+        }
+        if !phnsminimumdeviceperiod.is_null() {
+            unsafe { *phnsminimumdeviceperiod = minimumdeviceperiod }
+        }
+        // just assume no one will be silly here
+        Ok(())
     }
 
     fn Start(&self) -> windows::core::Result<()> {
@@ -917,7 +880,7 @@ impl IAudioClient3_Impl for RedirectAudioClient_Impl {
         audiosessionguid: *const GUID,
     ) -> windows::core::Result<()> {
         info!(
-            "RedirectAudioClient::InitializeSharedAudioStream() called, direction: {:?}",
+            "RedirectAudioClient::InitializeSharedAudioStream() -> replacing duration, direction: {:?}",
             self.dataflow
         );
         let target_cfg = CONFIG.get(self.dataflow);
@@ -1015,7 +978,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
             self.dataflow
         );
         if sharemode == AUDCLNT_SHAREMODE_SHARED {
-            info!("Original dur: {} * 100ns", hnsbufferduration);
+            info!("Original dur: {hnsbufferduration} * 100ns");
             let target_cfg = CONFIG.get(self.dataflow);
             unsafe {
                 let mut pdefaultperiodinframes = 0;
@@ -1039,10 +1002,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                 } else {
                     pminperiodinframes
                 };
-                info!(
-                    "Hooker period = {}, Min period = {}",
-                    calculated_len, pminperiodinframes
-                );
+                info!("Hooker period = {calculated_len}, Min period = {pminperiodinframes}");
                 self.hooker.InitializeSharedAudioStream(
                     streamflags,
                     calculated_len,
@@ -1080,10 +1040,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
 
     fn GetBufferSize(&self) -> windows::core::Result<u32> {
         let buf = unsafe { self.inner.GetBufferSize()? };
-        info!(
-            "RedirectCompatAudioClient::GetBufferSize() called, buffer length: {}",
-            buf
-        );
+        info!("RedirectCompatAudioClient::GetBufferSize() called, buffer length: {buf}");
         Ok(buf)
     }
 
@@ -1330,6 +1287,8 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
             periodinframes
         };
         unsafe {
+            self.trick
+                .store(TrickState::Transparent as u8, Ordering::Release);
             self.hooker.InitializeSharedAudioStream(
                 streamflags,
                 calculated_len,
