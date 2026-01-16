@@ -1,6 +1,6 @@
 [package]
 name = "wasapi_relink"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 
 [dependencies]
@@ -26,7 +26,8 @@ windows-core = "0.62.*"
 flexi_logger = "0.31.*"
 serde = { version = "1.*", features = ["derive"] }
 toml = "0.9.*"
-auto-allocator = "*"
+mimalloc = { version = "*", features = ["v3"] }
+# auto-allocator = "*"
 # ringbuf = "0.*"
 # parking_lot = "0.*"
 

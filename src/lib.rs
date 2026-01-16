@@ -1,9 +1,13 @@
 #[cfg(test)]
 mod config_test;
 
-#[allow(unused_imports)]
-#[allow(clippy::single_component_path_imports)]
-use auto_allocator;
+// #[allow(unused_imports)]
+// #[allow(clippy::single_component_path_imports)]
+// use auto_allocator;
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 // use openal_binds::*;
 use flexi_logger::*;
 use log::*;
