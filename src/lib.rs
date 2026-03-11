@@ -695,10 +695,7 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
             "RedirectAudioClient::GetMixFormat() called, direction: {:?}",
             self.dataflow
         );
-        let pformat = unsafe { self.inner.GetMixFormat()? };
-        let info_ref = unsafe { &mut *self.inner_info.get() };
-        info_ref.samplerate = unsafe { *pformat }.nSamplesPerSec;
-        Ok(pformat)
+        unsafe { self.inner.GetMixFormat() }
     }
 
     fn GetDevicePeriod(
@@ -723,9 +720,13 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
             let mut pfundamentalperiodinframes = 0;
             let mut pminperiodinframes = 0;
             let mut pmaxperiodinframes = 0;
+            let pformat = unsafe { self.inner.GetMixFormat()? };
+            if info_ref.samplerate == 0 {
+                info_ref.samplerate = unsafe { *pformat }.nSamplesPerSec;
+            }
             unsafe {
                 self.inner.GetSharedModeEnginePeriod(
-                    self.inner.GetMixFormat()?,
+                    pformat,
                     &mut pdefaultperiodinframes,
                     &mut pfundamentalperiodinframes,
                     &mut pminperiodinframes,
@@ -1395,6 +1396,9 @@ unsafe extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c
                 //     .unwrap()
                 //     .log_to_stdout()
                 //     .start();
+                std::panic::set_hook(Box::new(|panic_info| {
+                    error!("{panic_info}");
+                }));
                 let logger = Logger::with(<ConfigLogLevel as Into<LevelFilter>>::into(
                     CONFIG.log_level,
                 ));
