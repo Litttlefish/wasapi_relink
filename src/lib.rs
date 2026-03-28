@@ -14,6 +14,7 @@ use log::*;
 use retour::GenericDetour;
 use serde::*;
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::hint::unreachable_unchecked;
 use std::ops::Add;
 use std::os::raw::c_void;
@@ -115,6 +116,7 @@ impl RedirectConfig {
 struct ClientConfig {
     target_buffer_dur_ms: u16,
     compat: bool,
+    compat_buffer_len: HashMap<u32, i64>,
 }
 
 #[allow(clippy::redundant_closure)]
@@ -983,7 +985,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
             self.dataflow
         );
         if sharemode == AUDCLNT_SHAREMODE_SHARED {
-            info!("Original dur: {hnsbufferduration} * 100ns");
+            info!("Original duration: {hnsbufferduration} * 100ns");
             let target_cfg = CONFIG.get(self.dataflow);
             unsafe {
                 let mut pdefaultperiodinframes = 0;
@@ -997,9 +999,10 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     &mut pminperiodinframes,
                     &mut pmaxperiodinframes,
                 )?;
+                let samplerate = (*pformat).nSamplesPerSec;
                 let calculated_len = if target_cfg.target_buffer_dur_ms != 0 {
                     calculate_buffer(
-                        (*pformat).nSamplesPerSec,
+                        samplerate,
                         pfundamentalperiodinframes,
                         target_cfg.target_buffer_dur_ms,
                     )
@@ -1007,7 +1010,14 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                 } else {
                     pminperiodinframes
                 };
-                info!("Hooker period = {calculated_len}, Min period = {pminperiodinframes}");
+                let calculated_dur = target_cfg
+                    .compat_buffer_len
+                    .get(&samplerate)
+                    .copied()
+                    .unwrap_or_default();
+                info!(
+                    "Current Samplerate = {samplerate}; Hooker period = {calculated_len}, Min period = {pminperiodinframes}; Inner duration = {calculated_dur} * 100ns"
+                );
                 self.hooker.InitializeSharedAudioStream(
                     streamflags,
                     calculated_len,
@@ -1017,7 +1027,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                 self.inner.Initialize(
                     sharemode,
                     streamflags,
-                    0,
+                    calculated_dur,
                     hnsperiodicity,
                     pformat,
                     Some(audiosessionguid),

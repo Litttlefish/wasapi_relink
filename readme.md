@@ -96,7 +96,11 @@ only_log_stdout = false
 # e.g., 10 = 1ms.
 target_buffer_dur_ms = 10
 # Force this stream into compat mode (bool)
-compat = false
+compat = true
+# (Optional) Assign a shared stream buffer length to the corresponding samplerate.
+# The number will be directly used, and will be clamped by Windows if set too low.
+compat_buffer_len.48000 = 0 # this will clamp to minimum allowed value
+compat_buffer_len.96000 = 238350
 
 [capture]
 target_buffer_dur_ms = 10
@@ -120,6 +124,8 @@ compat = false
 
   - `compat` (bool): Forces this stream to use **Compat Mode**.
 
+  - `compat_buffer_len.<samplerate>` (i64): The target buffer size for shared stream in **units of 100 nanoseconds**. The tool/Windows will default to the driver's minimum if this is set too low or not specified. **This will help if you noticed audio pops after changing audio samplerate in shared mode.**
+
 ## 🩺Troubleshooting
 Use this guide to diagnose and fix common audio issues.
 
@@ -139,6 +145,11 @@ Use this guide to diagnose and fix common audio issues.
 1. **Increase Buffer:** Slightly increase `target_buffer_dur_ms`. If your driver's minimum is 2ms (e.g., `20`), try `30` (3ms) or `40` (4ms) until the pops disappear.
 
 2. **Try Compat Mode:** Set `compat = true`. This effectively adds a buffer layer for the application (i.e., the standard buffer from normal Shared mode). In combination with the changes made by Compat mode, this can potentially resolve the issue.
+
+### Audio Pop after changing samplerate in Windows settings
+**Phenomenon:** Audio playback is normal at samplerate A (e.g. 48000Hz), but pops at samplerate B (e.g. 96000 Hz).
+
+**Possible solution:** Adjusting compat_buffer_len will help.
 
 ### Program won't start
 **Phenomenon:** The target program fails to start after loading the DLL.

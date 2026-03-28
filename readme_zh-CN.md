@@ -94,7 +94,11 @@ log_level = "Info"
 # 例如：10 = 1ms。
 target_buffer_dur_ms = 10
 # 强制此流进入兼容模式 (bool)
-compat = false
+compat = true
+# (可选) 为兼容共享流在对应采样率下指定一个buffer长度。
+# 此处的数值会直接采用，过小的话会被Windows修改为驱动最小值。
+compat_buffer_len.48000 = 0 # 这一条会被修改为最小允许值
+compat_buffer_len.96000 = 238350
 
 [capture]
 target_buffer_dur_ms = 10
@@ -118,6 +122,9 @@ compat = false
 
   - `compat` (bool): 强制此流使用**兼容**模式。
 
+  - `compat_buffer_len.<samplerate>` (i64): 兼容流的目标缓冲区大小，单位为 **100 纳秒**。如果设置过低或未指定，工具/Windows会将其设为驱动最小值。**如果你在更换采样率后遇到爆音，此选项可能会有所帮助。**
+
+
 ## 🩺故障排查
 使用本指南诊断和修复常见的音频问题。
 
@@ -137,6 +144,11 @@ compat = false
 1. **增加缓冲区：** 略微增加 `target_buffer_dur_ms` 。如果驱动的最小值是 2ms (即 `20`)，请尝试 `30` (3ms) 或 `40` (4ms)，直到爆音消失。
 
 2. **尝试兼容模式：** 设置 `compat = true` 。这相当于为程序增加了一个缓冲层（即普通Shared模式给出的buffer），结合Compat模式的改变可能能解决问题。
+
+### 在Windows设置里更换采样率后出现爆音
+**现象：** 在采样率A(如48000 Hz)下音频正常，但在采样率B(如96000 Hz)爆音。
+
+**可能的解决方案：** 调整 `compat_buffer_len` 可能会有效。
 
 ### 程序无法启动
 **现象：** 加载 DLL 后目标程序启动失败。
