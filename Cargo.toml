@@ -23,7 +23,7 @@ windows-core = "0.62.*"
 flexi_logger = "0.31.*"
 serde = { version = "1.*", features = ["derive"] }
 toml = "1.*"
-mimalloc = { version = "*", features = ["v3"] }
+# mimalloc = { version = "*", features = ["v3"] }
 # uuid = { version = "1.20.0", features = ["v4"] }
 # min_hook_rs = "2.*"
 # auto-allocator = "*"
