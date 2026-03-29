@@ -4,10 +4,10 @@
 // #[allow(unused_imports)]
 // #[allow(clippy::single_component_path_imports)]
 // use auto_allocator;
-use mimalloc::MiMalloc;
+// use mimalloc::MiMalloc;
 
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+// #[global_allocator]
+// static GLOBAL: MiMalloc = MiMalloc;
 // use openal_binds::*;
 use flexi_logger::*;
 use log::*;
@@ -117,6 +117,7 @@ struct ClientConfig {
     target_buffer_dur_ms: u16,
     compat: bool,
     compat_buffer_len: HashMap<u32, i64>,
+    raw: bool,
 }
 
 #[allow(clippy::redundant_closure)]
@@ -576,25 +577,65 @@ const fn calculate_period(sample_rate: u32, buffer_len: u32) -> i64 {
     (buffer_len as i64 * 10000000) / sample_rate as i64
 }
 
-#[derive(Default)]
-struct InnerInfo {
+struct Shared3Info {
     current_buffer_len: u32,
     samplerate: u32,
+}
+impl Shared3Info {
+    fn init(inner: IAudioClient3, dataflow: DeviceDataFlow) -> Self {
+        let target_cfg = CONFIG.get(dataflow);
+        let mut pdefaultperiodinframes = 0;
+        let mut pfundamentalperiodinframes = 0;
+        let mut pminperiodinframes = 0;
+        let mut pmaxperiodinframes = 0;
+        let pformat = unsafe { inner.GetMixFormat().unwrap() };
+        unsafe {
+            inner
+                .GetSharedModeEnginePeriod(
+                    pformat,
+                    &mut pdefaultperiodinframes,
+                    &mut pfundamentalperiodinframes,
+                    &mut pminperiodinframes,
+                    &mut pmaxperiodinframes,
+                )
+                .unwrap()
+        };
+        let samplerate = unsafe { *pformat }.nSamplesPerSec;
+        let current_buffer_len = if target_cfg.target_buffer_dur_ms != 0 {
+            calculate_buffer(
+                samplerate,
+                pfundamentalperiodinframes,
+                target_cfg.target_buffer_dur_ms,
+            )
+            .clamp(pminperiodinframes, pmaxperiodinframes)
+        } else {
+            pminperiodinframes
+        };
+        info!(
+            "Current period = {current_buffer_len}, Min period = {pminperiodinframes}, Samplerate = {samplerate}"
+        );
+        Self {
+            current_buffer_len,
+            samplerate,
+        }
+    }
 }
 
 #[implement(IAudioClient3)]
 struct RedirectAudioClient {
     inner: IAudioClient3,
-    inner_info: UnsafeCell<InnerInfo>,
+    inner_info: Shared3Info,
     dataflow: DeviceDataFlow,
+    raw_flag: UnsafeCell<bool>,
 }
 
 impl RedirectAudioClient {
     fn new(inner: IAudioClient3, dataflow: DeviceDataFlow) -> Self {
         Self {
+            inner_info: Shared3Info::init(inner.clone(), dataflow),
             inner,
-            inner_info: InnerInfo::default().into(),
             dataflow,
+            raw_flag: false.into(),
         }
     }
 }
@@ -615,36 +656,19 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
         );
         if sharemode == AUDCLNT_SHAREMODE_SHARED {
             info!("Original dur: {hnsbufferduration} * 100ns");
-            let target_cfg = CONFIG.get(self.dataflow);
             unsafe {
-                let info_ref = &mut *self.inner_info.get();
-                info_ref.samplerate = (*pformat).nSamplesPerSec;
-                let mut pdefaultperiodinframes = 0;
-                let mut pfundamentalperiodinframes = 0;
-                let mut pminperiodinframes = 0;
-                let mut pmaxperiodinframes = 0;
-                self.inner.GetSharedModeEnginePeriod(
-                    pformat,
-                    &mut pdefaultperiodinframes,
-                    &mut pfundamentalperiodinframes,
-                    &mut pminperiodinframes,
-                    &mut pmaxperiodinframes,
-                )?;
-                let calculated_len = if target_cfg.target_buffer_dur_ms != 0 {
-                    calculate_buffer(
-                        info_ref.samplerate,
-                        pfundamentalperiodinframes,
-                        target_cfg.target_buffer_dur_ms,
-                    )
-                    .clamp(pminperiodinframes, pmaxperiodinframes)
-                } else {
-                    pminperiodinframes
-                };
-                info_ref.current_buffer_len = calculated_len;
-                info!("Current period = {calculated_len}, Min period = {pminperiodinframes}");
+                if CONFIG.get(self.dataflow).raw && !*self.raw_flag.get() {
+                    info!("Applying raw flag");
+                    let properties = AudioClientProperties {
+                        cbSize: size_of::<AudioClientProperties>() as u32,
+                        Options: AUDCLNT_STREAMOPTIONS_RAW,
+                        ..AudioClientProperties::default()
+                    };
+                    self.inner.SetClientProperties(&properties)?;
+                }
                 self.inner.InitializeSharedAudioStream(
                     streamflags,
-                    calculated_len,
+                    self.inner_info.current_buffer_len,
                     pformat,
                     Some(audiosessionguid),
                 )
@@ -714,43 +738,13 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
             self.inner
                 .GetDevicePeriod(None, Some(&mut minimumdeviceperiod))?
         };
-        let info_ref = unsafe { &mut *self.inner_info.get() };
-        if info_ref.current_buffer_len == 0 {
-            warn!("Called before initialize, inserting parameters");
-            let target_cfg = CONFIG.get(self.dataflow);
-            let mut pdefaultperiodinframes = 0;
-            let mut pfundamentalperiodinframes = 0;
-            let mut pminperiodinframes = 0;
-            let mut pmaxperiodinframes = 0;
-            let pformat = unsafe { self.inner.GetMixFormat()? };
-            if info_ref.samplerate == 0 {
-                info_ref.samplerate = unsafe { *pformat }.nSamplesPerSec;
-            }
-            unsafe {
-                self.inner.GetSharedModeEnginePeriod(
-                    pformat,
-                    &mut pdefaultperiodinframes,
-                    &mut pfundamentalperiodinframes,
-                    &mut pminperiodinframes,
-                    &mut pmaxperiodinframes,
-                )?
-            };
-            info_ref.current_buffer_len = if target_cfg.target_buffer_dur_ms != 0 {
-                calculate_buffer(
-                    info_ref.samplerate,
-                    pfundamentalperiodinframes,
-                    target_cfg.target_buffer_dur_ms,
-                )
-                .clamp(pminperiodinframes, pmaxperiodinframes)
-            } else {
-                pminperiodinframes
-            };
-        }
         if !phnsdefaultdeviceperiod.is_null() {
             unsafe {
-                *phnsdefaultdeviceperiod =
-                    calculate_period(info_ref.samplerate, info_ref.current_buffer_len)
-                        .max(minimumdeviceperiod)
+                *phnsdefaultdeviceperiod = calculate_period(
+                    self.inner_info.samplerate,
+                    self.inner_info.current_buffer_len,
+                )
+                .max(minimumdeviceperiod)
             }
         }
         if !phnsminimumdeviceperiod.is_null() {
@@ -824,6 +818,18 @@ impl IAudioClient2_Impl for RedirectAudioClient_Impl {
         pproperties: *const AudioClientProperties,
     ) -> windows::core::Result<()> {
         info!("RedirectAudioClient::SetClientProperties() called");
+        if CONFIG.get(self.dataflow).raw {
+            info!("Applying raw flag");
+            let option = &mut unsafe { *pproperties }.Options;
+            if option.contains(AUDCLNT_STREAMOPTIONS_RAW) {
+                warn!("This stream already has raw flag!")
+            } else {
+                *option |= AUDCLNT_STREAMOPTIONS_RAW
+            }
+            unsafe {
+                self.raw_flag.get().write(true);
+            };
+        }
         unsafe { self.inner.SetClientProperties(pproperties) }
     }
 
@@ -887,37 +893,22 @@ impl IAudioClient3_Impl for RedirectAudioClient_Impl {
         audiosessionguid: *const GUID,
     ) -> windows::core::Result<()> {
         info!(
-            "RedirectAudioClient::InitializeSharedAudioStream() -> replacing duration, direction: {:?}",
+            "RedirectAudioClient::InitializeSharedAudioStream() -> replacing period, current period: {periodinframes}, direction: {:?}",
             self.dataflow
         );
-        let target_cfg = CONFIG.get(self.dataflow);
-        let calculated_len = if target_cfg.target_buffer_dur_ms != 0 {
-            let mut pdefaultperiodinframes = 0;
-            let mut pfundamentalperiodinframes = 0;
-            let mut pminperiodinframes = 0;
-            let mut pmaxperiodinframes = 0;
-            unsafe {
-                self.inner.GetSharedModeEnginePeriod(
-                    pformat,
-                    &mut pdefaultperiodinframes,
-                    &mut pfundamentalperiodinframes,
-                    &mut pminperiodinframes,
-                    &mut pmaxperiodinframes,
-                )?
-            };
-            calculate_buffer(
-                unsafe { *pformat }.nSamplesPerSec,
-                pfundamentalperiodinframes,
-                target_cfg.target_buffer_dur_ms,
-            )
-            .clamp(pminperiodinframes, pmaxperiodinframes)
-        } else {
-            periodinframes
-        };
         unsafe {
+            if CONFIG.get(self.dataflow).raw && !*self.raw_flag.get() {
+                info!("Applying raw flag");
+                let properties = AudioClientProperties {
+                    cbSize: size_of::<AudioClientProperties>() as u32,
+                    Options: AUDCLNT_STREAMOPTIONS_RAW,
+                    ..AudioClientProperties::default()
+                };
+                self.inner.SetClientProperties(&properties)?;
+            }
             self.inner.InitializeSharedAudioStream(
                 streamflags,
-                calculated_len,
+                self.inner_info.current_buffer_len,
                 pformat,
                 Some(audiosessionguid),
             )
@@ -926,19 +917,19 @@ impl IAudioClient3_Impl for RedirectAudioClient_Impl {
 }
 
 #[derive(Default)]
-struct HookerInfo {
-    hooker_padding: u32,
+struct Shared1Info {
+    inner_padding: u32,
     align: u16,
     inner_buffer_len: u32,
     hooker_buffer_len: u32,
 }
-impl HookerInfo {
+impl Shared1Info {
     #[inline]
     fn init(&mut self, inner: u32, hooker: u32, align: u16) {
-        self.hooker_buffer_len = hooker;
         self.inner_buffer_len = inner;
+        self.hooker_buffer_len = hooker;
         self.align = align;
-        self.hooker_padding = inner - hooker;
+        self.inner_padding = inner - hooker;
     }
 }
 
@@ -955,17 +946,21 @@ struct RedirectCompatAudioClient {
     hooker: IAudioClient3,
     dataflow: DeviceDataFlow,
     trick: Arc<AtomicU8>,
-    hooker_info: UnsafeCell<HookerInfo>,
+    inner_info: UnsafeCell<Shared1Info>,
+    hooker_info: Shared3Info,
+    raw_flag: UnsafeCell<bool>,
 }
 
 impl RedirectCompatAudioClient {
     fn new(inner: IAudioClient3, hooker: IAudioClient3, dataflow: DeviceDataFlow) -> Self {
         Self {
+            hooker_info: Shared3Info::init(inner.clone(), dataflow),
             inner,
             hooker,
             dataflow,
             trick: AtomicU8::default().into(),
-            hooker_info: HookerInfo::default().into(),
+            inner_info: Shared1Info::default().into(),
+            raw_flag: false.into(),
         }
     }
 }
@@ -988,42 +983,28 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
             info!("Original duration: {hnsbufferduration} * 100ns");
             let target_cfg = CONFIG.get(self.dataflow);
             unsafe {
-                let mut pdefaultperiodinframes = 0;
-                let mut pfundamentalperiodinframes = 0;
-                let mut pminperiodinframes = 0;
-                let mut pmaxperiodinframes = 0;
-                self.inner.GetSharedModeEnginePeriod(
-                    pformat,
-                    &mut pdefaultperiodinframes,
-                    &mut pfundamentalperiodinframes,
-                    &mut pminperiodinframes,
-                    &mut pmaxperiodinframes,
-                )?;
-                let samplerate = (*pformat).nSamplesPerSec;
-                let calculated_len = if target_cfg.target_buffer_dur_ms != 0 {
-                    calculate_buffer(
-                        samplerate,
-                        pfundamentalperiodinframes,
-                        target_cfg.target_buffer_dur_ms,
-                    )
-                    .clamp(pminperiodinframes, pmaxperiodinframes)
-                } else {
-                    pminperiodinframes
-                };
-                let calculated_dur = target_cfg
-                    .compat_buffer_len
-                    .get(&samplerate)
-                    .copied()
-                    .unwrap_or_default();
-                info!(
-                    "Current Samplerate = {samplerate}; Hooker period = {calculated_len}, Min period = {pminperiodinframes}; Inner duration = {calculated_dur} * 100ns"
-                );
                 self.hooker.InitializeSharedAudioStream(
                     streamflags,
-                    calculated_len,
+                    self.hooker_info.current_buffer_len,
                     pformat,
                     Some(audiosessionguid),
                 )?;
+
+                let calculated_dur = target_cfg
+                    .compat_buffer_len
+                    .get(&self.hooker_info.samplerate)
+                    .copied()
+                    .unwrap_or_default();
+                info!("Inner duration = {calculated_dur} * 100ns");
+                if CONFIG.get(self.dataflow).raw && !*self.raw_flag.get() {
+                    info!("Applying raw flag");
+                    let properties = AudioClientProperties {
+                        cbSize: size_of::<AudioClientProperties>() as u32,
+                        Options: AUDCLNT_STREAMOPTIONS_RAW,
+                        ..AudioClientProperties::default()
+                    };
+                    self.inner.SetClientProperties(&properties)?;
+                }
                 self.inner.Initialize(
                     sharemode,
                     streamflags,
@@ -1032,7 +1013,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     pformat,
                     Some(audiosessionguid),
                 )?;
-                (&mut *self.hooker_info.get()).init(
+                (&mut *self.inner_info.get()).init(
                     self.inner.GetBufferSize()?,
                     self.hooker.GetBufferSize()?,
                     (*pformat).nBlockAlign,
@@ -1067,9 +1048,9 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
     fn GetCurrentPadding(&self) -> windows::core::Result<u32> {
         if self.trick.load(Ordering::Acquire) != TrickState::Transparent as u8 {
             info!("RedirectCompatAudioClient::GetCurrentPadding() called, tricking");
-            let info_ref = unsafe { &*self.hooker_info.get() };
+            let info_ref = unsafe { &*self.inner_info.get() };
             Ok(info_ref
-                .hooker_padding
+                .inner_padding
                 .add(unsafe { self.inner.GetCurrentPadding()? })
                 .min(info_ref.inner_buffer_len))
         } else {
@@ -1171,7 +1152,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
         match iid {
             IAudioRenderClient::IID => {
                 debug!("Returned RedirectAudioRenderClient");
-                let info_ref = unsafe { &*self.hooker_info.get() };
+                let info_ref = unsafe { &*self.inner_info.get() };
                 let redirected = RedirectAudioRenderClient::new(
                     self.trick.clone(),
                     unsafe { self.inner.GetService::<IAudioRenderClient>()? },
@@ -1211,6 +1192,18 @@ impl IAudioClient2_Impl for RedirectCompatAudioClient_Impl {
         pproperties: *const AudioClientProperties,
     ) -> windows::core::Result<()> {
         info!("RedirectCompatAudioClient::SetClientProperties() called");
+        if CONFIG.get(self.dataflow).raw {
+            info!("Applying raw flag");
+            let option = &mut unsafe { *pproperties }.Options;
+            if option.contains(AUDCLNT_STREAMOPTIONS_RAW) {
+                warn!("This stream already has raw flag!")
+            } else {
+                *option |= AUDCLNT_STREAMOPTIONS_RAW
+            }
+            unsafe {
+                self.raw_flag.get().write(true);
+            };
+        }
         unsafe { self.inner.SetClientProperties(pproperties) }
     }
 
@@ -1277,42 +1270,28 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
             "RedirectCompatAudioClient::InitializeSharedAudioStream() called, this shouldn't happen on compat mode! direction: {:?}",
             self.dataflow
         );
-        let target_cfg = CONFIG.get(self.dataflow);
-        let calculated_len = if target_cfg.target_buffer_dur_ms != 0 {
-            let mut pdefaultperiodinframes = 0;
-            let mut pfundamentalperiodinframes = 0;
-            let mut pminperiodinframes = 0;
-            let mut pmaxperiodinframes = 0;
-            unsafe {
-                self.inner.GetSharedModeEnginePeriod(
-                    pformat,
-                    &mut pdefaultperiodinframes,
-                    &mut pfundamentalperiodinframes,
-                    &mut pminperiodinframes,
-                    &mut pmaxperiodinframes,
-                )?
-            };
-            calculate_buffer(
-                unsafe { *pformat }.nSamplesPerSec,
-                pfundamentalperiodinframes,
-                target_cfg.target_buffer_dur_ms,
-            )
-            .clamp(pminperiodinframes, pmaxperiodinframes)
-        } else {
-            periodinframes
-        };
+        info!("Original period: {periodinframes}");
         unsafe {
             self.trick
                 .store(TrickState::Transparent as u8, Ordering::Release);
+            if CONFIG.get(self.dataflow).raw && !*self.raw_flag.get() {
+                info!("Applying raw flag");
+                let properties = AudioClientProperties {
+                    cbSize: size_of::<AudioClientProperties>() as u32,
+                    Options: AUDCLNT_STREAMOPTIONS_RAW,
+                    ..AudioClientProperties::default()
+                };
+                self.inner.SetClientProperties(&properties)?;
+            }
             self.hooker.InitializeSharedAudioStream(
                 streamflags,
-                calculated_len,
+                self.hooker_info.current_buffer_len,
                 pformat,
                 Some(audiosessionguid),
             )?;
             self.inner.InitializeSharedAudioStream(
                 streamflags,
-                calculated_len,
+                self.hooker_info.current_buffer_len,
                 pformat,
                 Some(audiosessionguid),
             )

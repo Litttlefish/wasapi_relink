@@ -105,6 +105,8 @@ compat_buffer_len.96000 = 238350
 [capture]
 target_buffer_dur_ms = 10
 compat = false
+# Enable raw process for this stream.
+raw = true
 ```
 
 ### Config Details
@@ -123,6 +125,8 @@ compat = false
   - `target_buffer_dur_ms` (u16): The target buffer size in **units of 0.1 milliseconds**. The tool will default to the driver's minimum if this is set too low or not specified. **You should generally not change this from the default value unless you experience audio pops.**
 
   - `compat` (bool): Forces this stream to use **Compat Mode**.
+
+  - `raw` (bool): Indicates this stream to use **Raw Mode**, which bypasses most APO.
 
   - `compat_buffer_len.<samplerate>` (i64): The target buffer size for shared stream in **units of 100 nanoseconds**. The tool/Windows will default to the driver's minimum if this is set too low or not specified. **This will help if you noticed audio pops after changing audio samplerate in shared mode.**
 
