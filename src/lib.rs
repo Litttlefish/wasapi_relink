@@ -12,16 +12,17 @@
 use flexi_logger::*;
 use log::*;
 use retour::GenericDetour;
+use ringbuf::traits::*;
+use ringbuf::*;
 use serde::*;
-use std::cell::UnsafeCell;
+use std::cell::{OnceCell, UnsafeCell};
 use std::collections::HashMap;
 use std::hint::unreachable_unchecked;
-use std::ops::Add;
 use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::slice::from_raw_parts_mut;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, atomic::*};
+use std::thread::{JoinHandle, spawn};
 
 use windows::{
     Win32::{
@@ -31,7 +32,11 @@ use windows::{
         System::Com::{StructuredStorage::*, *},
         System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
         System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH},
-        System::Threading::{GetCurrentThread, GetThreadDescription},
+        System::Threading::{
+            CREATE_EVENT, CreateEventExA, EVENT_MODIFY_STATE, GetCurrentThread,
+            GetThreadDescription, INFINITE, SYNCHRONIZATION_SYNCHRONIZE, SetEvent,
+            WaitForSingleObject,
+        },
         UI::Shell::PropertiesSystem::{IPropertyStore, IPropertyStore_Impl},
     },
     core::*,
@@ -114,10 +119,19 @@ impl RedirectConfig {
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct ClientConfig {
-    target_buffer_dur_ms: u16,
-    compat: bool,
+    target_buffer_dur_ms: u32,
+    ring_buffer_len: HashMap<u32, u32>,
+    mode: ClientMode,
     compat_buffer_len: HashMap<u32, i64>,
     raw: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+enum ClientMode {
+    #[default]
+    Normal,
+    Compat,
+    Ringbuf,
 }
 
 #[allow(clippy::redundant_closure)]
@@ -161,6 +175,8 @@ type FnCoCreateInstanceEx = unsafe extern "system" fn(
 const LIB_NAME: PCWSTR = w!("ole32.dll");
 const CO_CREATE: PCSTR = s!("CoCreateInstance");
 const CO_CREATE_EX: PCSTR = s!("CoCreateInstanceEx");
+
+const EVENT_CALLBACK: PCSTR = s!("wasapi_relink Audio Callback Thread");
 
 const KEYWORDS: &[&str] = &["[GAME]", "[SK]"];
 
@@ -368,16 +384,18 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
                         .inner
                         .Activate::<IAudioClient3>(dwclsctx, Some(pactivationparams))?;
                     let dataflow = self.inner.cast::<IMMEndpoint>()?.GetDataFlow()?.into();
-                    let proxy_unknown: IAudioClient3 = if !CONFIG.get(dataflow).compat {
-                        RedirectAudioClient::new(inner, dataflow).into()
-                    } else {
-                        RedirectCompatAudioClient::new(
+                    let proxy_unknown: IAudioClient3 = match CONFIG.get(dataflow).mode {
+                        ClientMode::Normal => RedirectAudioClient::new(inner, dataflow).into(),
+                        ClientMode::Compat => RedirectCompatAudioClient::new(
                             inner,
                             self.inner
                                 .Activate::<IAudioClient3>(dwclsctx, Some(pactivationparams))?,
                             dataflow,
                         )
-                        .into()
+                        .into(),
+                        ClientMode::Ringbuf => {
+                            RedirectRingbufAudioClient::new(inner, dataflow).into()
+                        }
                     };
                     assign(ppinterface, proxy_unknown)
                 }
@@ -569,8 +587,8 @@ impl From<EDataFlow> for DeviceDataFlow {
     }
 }
 
-const fn calculate_buffer(sample_rate: u32, fundamental: u32, target: u16) -> u32 {
-    sample_rate * target as u32 / 10000 / fundamental * fundamental
+const fn calculate_buffer(sample_rate: u32, fundamental: u32, target: u32) -> u32 {
+    sample_rate * target / 10000 / fundamental * fundamental
 }
 
 const fn calculate_period(sample_rate: u32, buffer_len: u32) -> i64 {
@@ -626,7 +644,7 @@ struct RedirectAudioClient {
     inner: IAudioClient3,
     inner_info: Shared3Info,
     dataflow: DeviceDataFlow,
-    raw_flag: UnsafeCell<bool>,
+    raw_flag: OnceCell<()>,
 }
 
 impl RedirectAudioClient {
@@ -635,7 +653,7 @@ impl RedirectAudioClient {
             inner_info: Shared3Info::init(inner.clone(), dataflow),
             inner,
             dataflow,
-            raw_flag: false.into(),
+            raw_flag: OnceCell::default(),
         }
     }
 }
@@ -657,7 +675,7 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
         if sharemode == AUDCLNT_SHAREMODE_SHARED {
             info!("Original dur: {hnsbufferduration} * 100ns");
             unsafe {
-                if CONFIG.get(self.dataflow).raw && !*self.raw_flag.get() {
+                if CONFIG.get(self.dataflow).raw && self.raw_flag.get().is_none() {
                     info!("Applying raw flag");
                     let properties = AudioClientProperties {
                         cbSize: size_of::<AudioClientProperties>() as u32,
@@ -826,9 +844,7 @@ impl IAudioClient2_Impl for RedirectAudioClient_Impl {
             } else {
                 *option |= AUDCLNT_STREAMOPTIONS_RAW
             }
-            unsafe {
-                self.raw_flag.get().write(true);
-            };
+            _ = self.raw_flag.set(());
         }
         unsafe { self.inner.SetClientProperties(pproperties) }
     }
@@ -897,7 +913,7 @@ impl IAudioClient3_Impl for RedirectAudioClient_Impl {
             self.dataflow
         );
         unsafe {
-            if CONFIG.get(self.dataflow).raw && !*self.raw_flag.get() {
+            if CONFIG.get(self.dataflow).raw && self.raw_flag.get().is_none() {
                 info!("Applying raw flag");
                 let properties = AudioClientProperties {
                     cbSize: size_of::<AudioClientProperties>() as u32,
@@ -916,23 +932,6 @@ impl IAudioClient3_Impl for RedirectAudioClient_Impl {
     }
 }
 
-#[derive(Default)]
-struct Shared1Info {
-    inner_padding: u32,
-    align: u16,
-    inner_buffer_len: u32,
-    hooker_buffer_len: u32,
-}
-impl Shared1Info {
-    #[inline]
-    fn init(&mut self, inner: u32, hooker: u32, align: u16) {
-        self.inner_buffer_len = inner;
-        self.hooker_buffer_len = hooker;
-        self.align = align;
-        self.inner_padding = inner - hooker;
-    }
-}
-
 #[repr(u8)]
 enum TrickState {
     Tricking,
@@ -946,21 +945,21 @@ struct RedirectCompatAudioClient {
     hooker: IAudioClient3,
     dataflow: DeviceDataFlow,
     trick: Arc<AtomicU8>,
-    inner_info: UnsafeCell<Shared1Info>,
+    inner_client: OnceCell<IAudioRenderClient>,
     hooker_info: Shared3Info,
-    raw_flag: UnsafeCell<bool>,
+    raw_flag: OnceCell<()>,
 }
 
 impl RedirectCompatAudioClient {
     fn new(inner: IAudioClient3, hooker: IAudioClient3, dataflow: DeviceDataFlow) -> Self {
         Self {
-            hooker_info: Shared3Info::init(inner.clone(), dataflow),
+            hooker_info: Shared3Info::init(hooker.clone(), dataflow),
             inner,
             hooker,
             dataflow,
             trick: AtomicU8::default().into(),
-            inner_info: Shared1Info::default().into(),
-            raw_flag: false.into(),
+            inner_client: OnceCell::default(),
+            raw_flag: OnceCell::default(),
         }
     }
 }
@@ -996,7 +995,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     .copied()
                     .unwrap_or_default();
                 info!("Inner duration = {calculated_dur} * 100ns");
-                if CONFIG.get(self.dataflow).raw && !*self.raw_flag.get() {
+                if CONFIG.get(self.dataflow).raw && self.raw_flag.get().is_none() {
                     info!("Applying raw flag");
                     let properties = AudioClientProperties {
                         cbSize: size_of::<AudioClientProperties>() as u32,
@@ -1013,10 +1012,15 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     pformat,
                     Some(audiosessionguid),
                 )?;
-                (&mut *self.inner_info.get()).init(
-                    self.inner.GetBufferSize()?,
-                    self.hooker.GetBufferSize()?,
-                    (*pformat).nBlockAlign,
+                _ = self.inner_client.set(
+                    RedirectCompatAudioRenderClient::new(
+                        self.trick.clone(),
+                        self.inner.GetService::<IAudioRenderClient>()?,
+                        (*pformat).nBlockAlign,
+                        self.inner.GetBufferSize()?,
+                        self.hooker.GetBufferSize()?,
+                    )
+                    .into(),
                 );
                 Ok(())
             }
@@ -1046,17 +1050,8 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
     }
 
     fn GetCurrentPadding(&self) -> windows::core::Result<u32> {
-        if self.trick.load(Ordering::Acquire) != TrickState::Transparent as u8 {
-            info!("RedirectCompatAudioClient::GetCurrentPadding() called, tricking");
-            let info_ref = unsafe { &*self.inner_info.get() };
-            Ok(info_ref
-                .inner_padding
-                .add(unsafe { self.inner.GetCurrentPadding()? })
-                .min(info_ref.inner_buffer_len))
-        } else {
-            trace!("RedirectCompatAudioClient::GetCurrentPadding() called");
-            unsafe { self.inner.GetCurrentPadding() }
-        }
+        trace!("RedirectCompatAudioClient::GetCurrentPadding() called");
+        unsafe { self.inner.GetCurrentPadding() }
     }
 
     fn IsFormatSupported(
@@ -1133,7 +1128,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
     }
 
     fn SetEventHandle(&self, eventhandle: HANDLE) -> windows::core::Result<()> {
-        warn!("RedirectCompatAudioClient::SetEventHandle() called, you shouldn't use compat mode!");
+        warn!("RedirectCompatAudioClient::SetEventHandle() called");
         unsafe {
             self.trick
                 .store(TrickState::Transparent as u8, Ordering::Release);
@@ -1151,17 +1146,12 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
 
         match iid {
             IAudioRenderClient::IID => {
-                debug!("Returned RedirectAudioRenderClient");
-                let info_ref = unsafe { &*self.inner_info.get() };
-                let redirected = RedirectAudioRenderClient::new(
-                    self.trick.clone(),
-                    unsafe { self.inner.GetService::<IAudioRenderClient>()? },
-                    info_ref.align,
-                    info_ref.inner_buffer_len,
-                    info_ref.hooker_buffer_len,
-                );
-                let renderclient: IAudioRenderClient = redirected.into();
-                unsafe { assign(ppv, renderclient) }
+                debug!("Returned RedirectCompatAudioRenderClient");
+                if let Some(service) = self.inner_client.get() {
+                    unsafe { service.query(&IAudioRenderClient::IID, ppv).ok() }
+                } else {
+                    unsafe { assign(ppv, self.inner.GetService::<IAudioRenderClient>()?) }
+                }
             }
             iid => boilerplate!(
                 iid,
@@ -1200,9 +1190,7 @@ impl IAudioClient2_Impl for RedirectCompatAudioClient_Impl {
             } else {
                 *option |= AUDCLNT_STREAMOPTIONS_RAW
             }
-            unsafe {
-                self.raw_flag.get().write(true);
-            };
+            _ = self.raw_flag.set(());
         }
         unsafe { self.inner.SetClientProperties(pproperties) }
     }
@@ -1274,7 +1262,7 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
         unsafe {
             self.trick
                 .store(TrickState::Transparent as u8, Ordering::Release);
-            if CONFIG.get(self.dataflow).raw && !*self.raw_flag.get() {
+            if CONFIG.get(self.dataflow).raw && self.raw_flag.get().is_none() {
                 info!("Applying raw flag");
                 let properties = AudioClientProperties {
                     cbSize: size_of::<AudioClientProperties>() as u32,
@@ -1300,14 +1288,14 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
 }
 
 #[implement(IAudioRenderClient)]
-struct RedirectAudioRenderClient {
+struct RedirectCompatAudioRenderClient {
     inner: IAudioRenderClient,
     trick_buffer: UnsafeCell<Vec<u8>>,
     trick: Arc<AtomicU8>,
     raw_hooker_len: usize,
     hooker_buffer_len: u32,
 }
-impl RedirectAudioRenderClient {
+impl RedirectCompatAudioRenderClient {
     fn new(
         trick: Arc<AtomicU8>,
         inner: IAudioRenderClient,
@@ -1324,11 +1312,11 @@ impl RedirectAudioRenderClient {
         }
     }
 }
-impl IAudioRenderClient_Impl for RedirectAudioRenderClient_Impl {
+impl IAudioRenderClient_Impl for RedirectCompatAudioRenderClient_Impl {
     fn GetBuffer(&self, numframesrequested: u32) -> windows::core::Result<*mut u8> {
         if self.trick.load(Ordering::Acquire) != TrickState::Transparent as u8 {
             info!(
-                "RedirectAudioRenderClient::GetBuffer() called, requested: {numframesrequested}, tricking"
+                "RedirectCompatAudioRenderClient::GetBuffer() called, requested: {numframesrequested}, tricking"
             );
             Ok(unsafe { &mut *self.trick_buffer.get() }.as_mut_ptr())
         } else {
@@ -1337,10 +1325,13 @@ impl IAudioRenderClient_Impl for RedirectAudioRenderClient_Impl {
     }
 
     fn ReleaseBuffer(&self, numframeswritten: u32, dwflags: u32) -> windows::core::Result<()> {
+        if numframeswritten == 0 {
+            return Ok(());
+        }
         match unsafe { std::mem::transmute::<u8, TrickState>(self.trick.load(Ordering::Acquire)) } {
             TrickState::Tricking => {
                 info!(
-                    "RedirectAudioRenderClient::ReleaseBuffer() called, written: {numframeswritten}, tricking"
+                    "RedirectCompatAudioRenderClient::ReleaseBuffer() called, written: {numframeswritten}, tricking"
                 );
                 unsafe {
                     info!(
@@ -1369,6 +1360,518 @@ impl IAudioRenderClient_Impl for RedirectAudioRenderClient_Impl {
     }
 }
 
+fn callback(
+    handle: HANDLE,
+    mut buffer: CachingCons<Arc<HeapRb<u8>>>,
+    client: IAudioClient3,
+    align: usize,
+    dwflag: Arc<AtomicU32>,
+    stop_flag: Arc<AtomicBool>,
+) {
+    let inner = unsafe { client.GetService::<IAudioRenderClient>().unwrap() };
+    let real_len = unsafe { client.GetBufferSize().unwrap() } as usize;
+    loop {
+        unsafe {
+            WaitForSingleObject(handle, INFINITE);
+        }
+        if stop_flag.load(Ordering::Acquire) {
+            break;
+        }
+        let read_len = buffer.occupied_len() / align;
+        if read_len == 0 {
+            if unsafe { client.GetCurrentPadding().unwrap() } == 0 {
+                warn!("all buffer has been emptied, underflow may happen!");
+            }
+            continue;
+        }
+        trace!("callback! data in mid-buffer: {read_len}");
+        let write_len =
+            read_len.min(real_len - unsafe { client.GetCurrentPadding().unwrap() } as usize);
+        trace!("callback! data should write: {write_len}");
+
+        let slice = unsafe {
+            from_raw_parts_mut(
+                inner.GetBuffer(write_len as u32).unwrap(),
+                write_len * align,
+            )
+        };
+        let written = (buffer.pop_slice(slice) / align) as u32;
+        trace!("callback! data written: {written}");
+        unsafe {
+            inner
+                .ReleaseBuffer(written, dwflag.load(Ordering::Acquire))
+                .unwrap()
+        };
+    }
+}
+
+#[implement(IAudioClient3)]
+struct RedirectRingbufAudioClient {
+    inner: IAudioClient3,
+    inner_info: Shared3Info,
+    dataflow: DeviceDataFlow,
+    raw_flag: OnceCell<()>,
+    client: OnceCell<(IAudioRenderClient, Arc<HeapRb<u8>>, u32 /* align */)>,
+    trick: Arc<AtomicU8>,
+}
+
+impl RedirectRingbufAudioClient {
+    fn new(inner: IAudioClient3, dataflow: DeviceDataFlow) -> Self {
+        Self {
+            inner_info: Shared3Info::init(inner.clone(), dataflow),
+            inner,
+            dataflow,
+            raw_flag: OnceCell::default(),
+            client: OnceCell::default(),
+            trick: AtomicU8::default().into(),
+        }
+    }
+}
+
+impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
+    fn Initialize(
+        &self,
+        sharemode: AUDCLNT_SHAREMODE,
+        mut streamflags: u32,
+        hnsbufferduration: i64,
+        hnsperiodicity: i64,
+        pformat: *const WAVEFORMATEX,
+        audiosessionguid: *const GUID,
+    ) -> windows::core::Result<()> {
+        info!(
+            "RedirectRingbufAudioClient::Initialize() -> Adding ring buffer, direction: {:?}",
+            self.dataflow
+        );
+        if sharemode == AUDCLNT_SHAREMODE_SHARED {
+            info!("Original dur: {hnsbufferduration} * 100ns");
+            unsafe {
+                let target_config = CONFIG.get(self.dataflow);
+                if target_config.raw && self.raw_flag.get().is_none() {
+                    info!("Applying raw flag");
+                    let properties = AudioClientProperties {
+                        cbSize: size_of::<AudioClientProperties>() as u32,
+                        Options: AUDCLNT_STREAMOPTIONS_RAW,
+                        ..AudioClientProperties::default()
+                    };
+                    self.inner.SetClientProperties(&properties)?;
+                }
+                let mut handle = None;
+                if !streamflags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK != 0 {
+                    info!("Applying event flag");
+                    let align = (*pformat).nBlockAlign;
+                    let channels = (*pformat).nChannels as u32;
+                    streamflags |= AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+                    let buf_len = if let Some(buf) = target_config
+                        .ring_buffer_len
+                        .get(&self.inner_info.samplerate)
+                        .copied()
+                        && buf != 0
+                    {
+                        self.inner_info.current_buffer_len.max(buf) * channels
+                    } else {
+                        self.inner_info.current_buffer_len * (channels + 1) * 4
+                    };
+                    let buffer = Arc::new(HeapRb::new(buf_len as usize * align as usize));
+                    let (producer, consumer) = buffer.clone().split();
+                    let callback_handle = CreateEventExA(
+                        None,
+                        EVENT_CALLBACK,
+                        CREATE_EVENT::default(),
+                        (EVENT_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE).0,
+                    )?;
+                    let dwflag: Arc<AtomicU32> = AtomicU32::default().into();
+                    let stop_flag: Arc<AtomicBool> = AtomicBool::default().into();
+                    let weak = self.inner.downgrade()?;
+                    let h = callback_handle.0.expose_provenance();
+
+                    let thread_dwflag = dwflag.clone();
+                    let thread_stop_flag = stop_flag.clone();
+
+                    let thread = spawn(move || {
+                        callback(
+                            HANDLE(std::ptr::with_exposed_provenance_mut::<c_void>(h)),
+                            consumer,
+                            weak.upgrade().unwrap(),
+                            align as usize,
+                            thread_dwflag,
+                            thread_stop_flag,
+                        );
+                    });
+                    _ = handle.insert(callback_handle);
+                    _ = self.client.set((
+                        RedirectRingBufAudioRenderClient {
+                            buffer: (producer, vec![0u8; buf_len as usize * align as usize]).into(),
+                            inner_buf_len: self.inner_info.current_buffer_len * channels,
+                            align: align as usize,
+                            thread: (callback_handle, Some(thread)),
+                            dwflag,
+                            stop_flag,
+                            trick: self.trick.clone(),
+                        }
+                        .into(),
+                        buffer,
+                        align as u32,
+                    ));
+                }
+                self.inner.InitializeSharedAudioStream(
+                    streamflags,
+                    self.inner_info.current_buffer_len,
+                    pformat,
+                    Some(audiosessionguid),
+                )?;
+                if let Some(handle) = handle {
+                    self.inner.SetEventHandle(handle)?;
+                }
+                Ok(())
+            }
+        } else {
+            unsafe {
+                self.inner.Initialize(
+                    sharemode,
+                    streamflags,
+                    hnsbufferduration,
+                    hnsperiodicity,
+                    pformat,
+                    Some(audiosessionguid),
+                )
+            }
+        }
+    }
+
+    fn GetBufferSize(&self) -> windows::core::Result<u32> {
+        let buf = if let Some((_, buffer, align)) = self.client.get() {
+            buffer.capacity().get() as u32 / align
+        } else {
+            unsafe { self.inner.GetBufferSize()? }
+        };
+        info!("RedirectRingbufAudioClient::GetBufferSize() called, buffer length: {buf}");
+        Ok(buf)
+    }
+
+    fn GetStreamLatency(&self) -> windows::core::Result<i64> {
+        info!("RedirectRingbufAudioClient::GetStreamLatency() called");
+        unsafe { self.inner.GetStreamLatency() }
+    }
+
+    fn GetCurrentPadding(&self) -> windows::core::Result<u32> {
+        trace!("RedirectRingbufAudioClient::GetCurrentPadding() called");
+        if let Some((_, buffer, align)) = self.client.get() {
+            Ok(buffer.occupied_len() as u32 / align)
+        } else {
+            unsafe { self.inner.GetCurrentPadding() }
+        }
+    }
+
+    fn IsFormatSupported(
+        &self,
+        sharemode: AUDCLNT_SHAREMODE,
+        pformat: *const WAVEFORMATEX,
+        ppclosestmatch: *mut *mut WAVEFORMATEX,
+    ) -> HRESULT {
+        debug!("RedirectRingbufAudioClient::IsFormatSupported() called");
+        unsafe {
+            self.inner
+                .IsFormatSupported(sharemode, pformat, Some(ppclosestmatch))
+        }
+    }
+
+    fn GetMixFormat(&self) -> windows::core::Result<*mut WAVEFORMATEX> {
+        info!(
+            "RedirectRingbufAudioClient::GetMixFormat() called, direction: {:?}",
+            self.dataflow
+        );
+        unsafe { self.inner.GetMixFormat() }
+    }
+
+    fn GetDevicePeriod(
+        &self,
+        phnsdefaultdeviceperiod: *mut i64,
+        phnsminimumdeviceperiod: *mut i64,
+    ) -> windows::core::Result<()> {
+        info!(
+            "RedirectRingbufAudioClient::GetDevicePeriod() called, direction: {:?}",
+            self.dataflow
+        );
+        let mut minimumdeviceperiod = 0;
+        unsafe {
+            self.inner
+                .GetDevicePeriod(None, Some(&mut minimumdeviceperiod))?
+        };
+        if !phnsdefaultdeviceperiod.is_null() {
+            unsafe {
+                *phnsdefaultdeviceperiod = calculate_period(
+                    self.inner_info.samplerate,
+                    self.inner_info.current_buffer_len,
+                )
+                .max(minimumdeviceperiod)
+            }
+        }
+        if !phnsminimumdeviceperiod.is_null() {
+            unsafe { *phnsminimumdeviceperiod = minimumdeviceperiod }
+        }
+        // just assume no one will be silly here
+        Ok(())
+    }
+
+    fn Start(&self) -> windows::core::Result<()> {
+        info!(
+            "RedirectRingbufAudioClient::Start() called, direction: {:?}",
+            self.dataflow
+        );
+        self.trick
+            .store(TrickState::Transparent as u8, Ordering::Release);
+        unsafe { self.inner.Start() }
+    }
+
+    fn Stop(&self) -> windows::core::Result<()> {
+        info!(
+            "RedirectRingbufAudioClient::Stop() called, direction: {:?}",
+            self.dataflow
+        );
+        unsafe { self.inner.Stop() }
+    }
+
+    fn Reset(&self) -> windows::core::Result<()> {
+        info!(
+            "RedirectRingbufAudioClient::Reset() called, direction: {:?}",
+            self.dataflow
+        );
+        self.trick
+            .store(TrickState::Tricking as u8, Ordering::Release);
+        unsafe { self.inner.Reset() }
+    }
+
+    fn SetEventHandle(&self, eventhandle: HANDLE) -> windows::core::Result<()> {
+        info!(
+            "RedirectRingbufAudioClient::SetEventHandle() called, Application has it's own event handle, can't use ours!"
+        );
+        self.trick
+            .store(TrickState::Transparent as u8, Ordering::Release);
+        unsafe { self.inner.SetEventHandle(eventhandle) }
+    }
+
+    fn GetService(&self, riid: *const GUID, ppv: *mut *mut c_void) -> windows::core::Result<()> {
+        let iid = unsafe { *riid };
+        debug!(
+            "RedirectRingbufAudioClient::GetService() called, iid: {iid:?}, direction: {:?}",
+            self.dataflow
+        );
+        match iid {
+            IAudioRenderClient::IID => {
+                // hope no one will release or re-acquire this
+                if let Some((service, ..)) = self.client.get() {
+                    unsafe { service.query(&IAudioRenderClient::IID, ppv).ok() }
+                } else {
+                    unsafe { assign(ppv, self.inner.GetService::<IAudioRenderClient>()?) }
+                }
+            }
+            _ => boilerplate!(
+                iid,
+                ppv,
+                self,
+                [
+                    IAudioSessionControl,
+                    IAudioCaptureClient,
+                    IAudioClientDuckingControl,
+                    IAudioClock,
+                    IChannelAudioVolume,
+                    ISimpleAudioVolume,
+                    IAudioStreamVolume
+                ]
+            ),
+        }
+    }
+}
+
+impl IAudioClient2_Impl for RedirectRingbufAudioClient_Impl {
+    fn IsOffloadCapable(&self, category: AUDIO_STREAM_CATEGORY) -> windows::core::Result<BOOL> {
+        info!("RedirectRingbufAudioClient::IsOffloadCapable() called");
+        unsafe { self.inner.IsOffloadCapable(category) }
+    }
+
+    fn SetClientProperties(
+        &self,
+        pproperties: *const AudioClientProperties,
+    ) -> windows::core::Result<()> {
+        info!("RedirectRingbufAudioClient::SetClientProperties() called");
+        if CONFIG.get(self.dataflow).raw {
+            info!("Applying raw flag");
+            let option = &mut unsafe { *pproperties }.Options;
+            if option.contains(AUDCLNT_STREAMOPTIONS_RAW) {
+                warn!("This stream already has raw flag!")
+            } else {
+                *option |= AUDCLNT_STREAMOPTIONS_RAW
+            }
+            _ = self.raw_flag.set(());
+        }
+        unsafe { self.inner.SetClientProperties(pproperties) }
+    }
+
+    fn GetBufferSizeLimits(
+        &self,
+        pformat: *const WAVEFORMATEX,
+        beventdriven: BOOL,
+        phnsminbufferduration: *mut i64,
+        phnsmaxbufferduration: *mut i64,
+    ) -> windows::core::Result<()> {
+        info!("RedirectRingbufAudioClient::GetBufferSizeLimits() called");
+        unsafe {
+            self.inner.GetBufferSizeLimits(
+                pformat,
+                beventdriven.into(),
+                phnsminbufferduration,
+                phnsmaxbufferduration,
+            )
+        }
+    }
+}
+
+impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
+    fn GetSharedModeEnginePeriod(
+        &self,
+        pformat: *const WAVEFORMATEX,
+        pdefaultperiodinframes: *mut u32,
+        pfundamentalperiodinframes: *mut u32,
+        pminperiodinframes: *mut u32,
+        pmaxperiodinframes: *mut u32,
+    ) -> windows::core::Result<()> {
+        info!("RedirectRingbufAudioClient::GetSharedModeEnginePeriod() called");
+        unsafe {
+            self.inner.GetSharedModeEnginePeriod(
+                pformat,
+                pdefaultperiodinframes,
+                pfundamentalperiodinframes,
+                pminperiodinframes,
+                pmaxperiodinframes,
+            )
+        }
+    }
+
+    fn GetCurrentSharedModeEnginePeriod(
+        &self,
+        ppformat: *mut *mut WAVEFORMATEX,
+        pcurrentperiodinframes: *mut u32,
+    ) -> windows::core::Result<()> {
+        info!("RedirectRingbufAudioClient::GetCurrentSharedModeEnginePeriod() called");
+        unsafe {
+            self.inner
+                .GetCurrentSharedModeEnginePeriod(ppformat, pcurrentperiodinframes)
+        }
+    }
+
+    fn InitializeSharedAudioStream(
+        &self,
+        streamflags: u32,
+        periodinframes: u32,
+        pformat: *const WAVEFORMATEX,
+        audiosessionguid: *const GUID,
+    ) -> windows::core::Result<()> {
+        info!(
+            "RedirectRingbufAudioClient::InitializeSharedAudioStream() -> replacing period, current period: {periodinframes}, direction: {:?}",
+            self.dataflow
+        );
+        unsafe {
+            if CONFIG.get(self.dataflow).raw && self.raw_flag.get().is_none() {
+                info!("Applying raw flag");
+                let properties = AudioClientProperties {
+                    cbSize: size_of::<AudioClientProperties>() as u32,
+                    Options: AUDCLNT_STREAMOPTIONS_RAW,
+                    ..AudioClientProperties::default()
+                };
+                self.inner.SetClientProperties(&properties)?;
+            }
+            self.inner.InitializeSharedAudioStream(
+                streamflags,
+                self.inner_info.current_buffer_len,
+                pformat,
+                Some(audiosessionguid),
+            )
+        }
+    }
+}
+
+#[implement(IAudioRenderClient)]
+struct RedirectRingBufAudioRenderClient {
+    buffer: UnsafeCell<(CachingProd<Arc<HeapRb<u8>>>, Vec<u8>)>,
+    inner_buf_len: u32,
+    align: usize,
+    thread: (HANDLE, Option<JoinHandle<()>>),
+    dwflag: Arc<AtomicU32>,
+    stop_flag: Arc<AtomicBool>,
+    trick: Arc<AtomicU8>,
+}
+impl IAudioRenderClient_Impl for RedirectRingBufAudioRenderClient_Impl {
+    fn GetBuffer(&self, numframesrequested: u32) -> windows::core::Result<*mut u8> {
+        if self.trick.load(Ordering::Acquire) != TrickState::Transparent as u8 {
+            info!(
+                "RedirectRingBufAudioRenderClient::GetBuffer() called, requested: {numframesrequested}"
+            );
+        }
+        debug!("GetBuffer called, requested: {numframesrequested}");
+        Ok(unsafe { &mut *self.buffer.get() }.1.as_mut_ptr())
+    }
+    fn ReleaseBuffer(&self, numframeswritten: u32, dwflags: u32) -> windows::core::Result<()> {
+        if numframeswritten == 0 {
+            warn!("no data written in this release call, overflow may happen!");
+            return Ok(());
+        }
+        let to_write = match unsafe {
+            std::mem::transmute::<u8, TrickState>(self.trick.load(Ordering::Acquire))
+        } {
+            TrickState::Tricking => {
+                info!(
+                    "RedirectRingBufAudioRenderClient::ReleaseBuffer() called, written: {numframeswritten}, tricking"
+                );
+                info!(
+                    "filling silent buffer, {} samples filled",
+                    self.inner_buf_len
+                );
+                self.trick
+                    .store(TrickState::Filled as u8, Ordering::Release);
+                self.inner_buf_len
+            }
+            TrickState::Filled => {
+                info!("already filled, discarding");
+                return Ok(());
+            }
+            TrickState::Transparent => numframeswritten,
+        } as usize;
+        let (buffer, temp_buffer) = unsafe { &mut *self.buffer.get() };
+        let slice = &temp_buffer[0..(to_write * self.align)];
+        let written_len = buffer.push_slice(slice) / self.align;
+        self.dwflag.store(dwflags, Ordering::Release);
+        if to_write != numframeswritten as usize {
+            unsafe {
+                SetEvent(self.thread.0).ok();
+            }
+        }
+        debug!("ReleaseBuffer called, written: {written_len}");
+        Ok(())
+    }
+}
+
+impl Drop for RedirectRingBufAudioRenderClient {
+    fn drop(&mut self) {
+        self.stop_flag.store(true, Ordering::Release);
+
+        if let Some(thread) = self.thread.1.take() {
+            unsafe {
+                SetEvent(self.thread.0).ok();
+            }
+            let join_result = thread.join();
+            match join_result {
+                Ok(()) => {
+                    info!("Consumer thread stopped");
+                }
+                Err(e) => {
+                    error!("Consumer thread panicked on shutdown: {:?}", e);
+                }
+            }
+            unsafe { self.thread.0.free() };
+        }
+    }
+}
+
 #[unsafe(export_name = "proxy")]
 extern "C" fn proxy_dummy() {}
 
@@ -1380,7 +1883,7 @@ unsafe extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c
                 HOOK_CO_CREATE_INSTANCE.enable().unwrap();
                 HOOK_CO_CREATE_INSTANCE_EX.enable().unwrap();
             };
-            std::thread::spawn(|| {
+            spawn(|| {
                 // let _logger = Logger::try_with_env_or_str("info")
                 //     .unwrap()
                 //     .log_to_stdout()

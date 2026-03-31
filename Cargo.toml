@@ -1,6 +1,6 @@
 [package]
 name = "wasapi_relink"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 
 [dependencies]
@@ -11,6 +11,7 @@ windows = { version = "0.62.*", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
+    "Win32_Security",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_SystemServices",
     "Win32_Media_Audio_DirectSound",
@@ -23,17 +24,17 @@ windows-core = "0.62.*"
 flexi_logger = "0.31.*"
 serde = { version = "1.*", features = ["derive"] }
 toml = "1.*"
+ringbuf = "0.*"
 # mimalloc = { version = "*", features = ["v3"] }
 # uuid = { version = "1.20.0", features = ["v4"] }
 # min_hook_rs = "2.*"
 # auto-allocator = "*"
-# ringbuf = "0.*"
 # parking_lot = "0.*"
 
 [dev-dependencies]
 # openal = "0.2.2"
 # openal-binds = { path = "./openal-binds" }
-simple_logger = "5.1.0"
+simple_logger = "5.*"
 # structured-logger = "1.0.5"
 # libloading = "0.8.9"
 
