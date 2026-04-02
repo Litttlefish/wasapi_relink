@@ -24,10 +24,10 @@ You must uninstall the Realtek drivers and force Windows to install the generic 
 Or, use a professional soundcard or external audio interface that supports low-latency.
 
 ## 🚀How It Works: The "Grafting"
-`wasapi_relink` operates in two distinct modes to handle different types of applications.
+`wasapi_relink` operates in three distinct modes to handle different types of applications.
 
-### Normal Mode (For Event-Driven Apps)
-**Target:** Applications and games that use event-driven (callback-based) audio streaming.
+### Normal Mode (For modern apps)
+**Target:** Applications and games that use event‑driven (callback) WASAPI audio and already behave well.
 
 **Method:**
 
@@ -37,24 +37,43 @@ Or, use a professional soundcard or external audio interface that supports low-l
 
 3. This provides the application with a much smaller buffer (e.g., 2ms), dramatically reducing latency.
 
-### Compat Mode (For Poll-Driven Apps)
-    This is the core of the project, designed for applications that uses polling (loop-based) audio stream.
-
-**Target:** Applications and games that use poll-driven streaming.
+### Compat Mode (For compatibility with legacy/poorly coded apps)
+**Target:** Programs that break if you only shrink their buffer, and Ringbuf mode doesn't work well with them.
 
 **Method:**
 
 1. Hooks `IMMDevice::Activate` and creates **two** `IAudioClient3` instances.
 
-2. **Instance A (Transparent):** Is initialized in a regular Shared mode that the application expects.
+- **Instance A (App‑facing):** Is initialized in a regular Shared mode that the program expects.
 
-3. **Instance B (Hooker):** Is initialized in `IAudioClient3`'s __low-latency mode__. This is the key: it [**triggers a special Windows behavior**](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/low-latency-audio#faq) that forces the actual hardware audio engine buffer to align with this low-latency request (e.g. 2ms).
+- **Instance B (Low‑latency):** Is initialized with `IAudioClient3::InitializeSharedAudioStream `using the tool’s low‑latency period. This client may not be used by the app at all; its main job is to influence the Windows audio engine.
 
-4. **Prefill Deception:** `wasapi_relink` then intercepts the application's silent prefill process, **deceiving it** into filling a much smaller buffer that matches the new hardware buffer size.
+2. **Engine‑side effect:** According to [**Microsoft’s low‑latency documentation**](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/low-latency-audio#faq), when any application on an endpoint requests small buffers via `IAudioClient3`, the audio engine switches to that small period for all shared‑mode streams on the same endpoint. By keeping the low‑latency client alive, `wasapi_relink` forces the engine to run at the small period even though the “main” app client is using a larger buffer.
 
-**Result:** At this point, the buffer requested in standard shared mode effectively acts as an intermediate buffer layer.
+3. **Prefill Deception:** Before `IAudioClient::Start`, many apps will write “silent” prefill data. `wasapi_relink` intercepts this via the wrapped `IAudioRenderClient`, then writes a smaller prefill (sized to the real engine period) into the hardware client.'
+
+**Result:** The app continues to work as if it had its original large buffer.
 - **Worst-case:** Latency is doubled comparing to normal mode (the sum of the pre-filled buffer and the device buffer).
-- **Best-case:** Latency is identical to the normal mode.
+- **Best-case:** Latency is close to the normal mode.
+
+### Ringbuf Mode (Most powerful)
+**Target:** Programs that use polling or fixed‑size mixing and/or have problematic timing behavior.
+
+**Method:**
+
+1. Intercepts `Initialize` / `InitializeSharedAudioStream` and always calls `InitializeSharedAudioStream` with the tool’s low‑latency period.
+
+2. Creates an internal ring buffer whose capacity is exposed to the app as the reported `IAudioClient::GetBufferSize`, and `IAudioClient::GetCurrentPadding` reports how much data is in the ring buffer, not the real engine buffer. The app feels like it’s writing into a large, traditional buffer, while the engine actually runs at the small period.
+
+3. Injection and inverse modes
+- If the application doesn't use event-driven flag, `wasapi_relink` injects `AUDCLNT_STREAMFLAGS_EVENTCALLBACK` and runs its own consumer thread that waits on real engine event, move the data from the ring buffer to `IAudioRenderClient` on the real client.
+- If the application requested event-driven flag, `wasapi_relink` takes over the app’s event handle and decides when to call `SetEvent` to wake the app’s callback. Internally it still uses its own thread to consume from the ring buffer. In effect, the chain becomes:
+```
+hardware engine → ringbuf consumer thread → app callback
+```
+4. Prefill deception still applies.
+
+**Result:** The app just sees a large, friendly WASAPI client, fully isolated from the engine’s real timing and buffer size, which works even with “broken” timing patterns (fixed‑size blocks, sleep‑based loops, etc.).
 
 ## 🔧How to Use (Injection)
 This library **does not** include its own DLL injector. You must use an external tool or [stub generator](https://github.com/namazso/dll-proxy-generator).
@@ -90,23 +109,29 @@ log_level = "Info"
 # Log only to stdout (true) or to both stdout and file (false).
 only_log_stdout = false
 
-[playback]
-# Target buffer duration in 0.1ms units (u16).
+[capture]
+# (General) Target buffer duration in 0.1ms units (u16).
 # The tool will calculate the closest buffer size *not exceeding* this duration while clamped within driver range.
-# e.g., 10 = 1ms.
-target_buffer_dur_ms = 10
-# Force this stream into compat mode (bool)
-compat = true
-# (Optional) Assign a shared stream buffer length to the corresponding samplerate.
-# The number will be directly used, and will be clamped by Windows if set too low.
+# e.g., 20 = 2.0ms.
+target_buffer_dur_ms = 20
+# (General) Enable raw process for this stream (bool).
+raw = true
+
+[playback]
+
+# Tool mode, available mode: Normal, Compat, Ringbuf
+mode = "Ringbuf"
+
+# (Ringbuf mode exclusive, Optional) Assign a ring buffer length (in audio frames) to the corresponding samplerate.
+# The number will be automatically rounded UP to align with the driver's fundamental period for optimal performance.
+ring_buffer_len.48000 = 340
+
+# (Compat mode exclusive, Optional) Assign a shared stream buffer duration (in 100-nanosecond units) to the corresponding samplerate.
+# The number will be directly used as the inner shared buffer, and will be clamped by Windows if set too low.
 compat_buffer_len.48000 = 0 # this will clamp to minimum allowed value
 compat_buffer_len.96000 = 238350
 
-[capture]
-target_buffer_dur_ms = 10
-compat = false
-# Enable raw process for this stream.
-raw = true
+
 ```
 
 ### Config Details
@@ -118,17 +143,20 @@ raw = true
 - `only_log_stdout` (bool): Controls logging targets.
   - `true`: Logs _only_ to the standard output (stdout). No log file will be created.
   - `false` (Default): Logs to __both__ the standard output (stdout) and the file specified by `log_path`.
-  - This option is particularly useful for developers who want to monitor logs in real-time in a terminal or for applications running in containerized environments (like Docker) where capturing stdout is the standard practice.
+    - This option is particularly useful for developers who want to monitor logs in real-time in a terminal or for applications running in containerized environments (like Docker) where capturing stdout is the standard practice.
 
 - `[playback]`/`[capture]`: Separate configs for output and input.
 
-  - `target_buffer_dur_ms` (u16): The target buffer size in **units of 0.1 milliseconds**. The tool will default to the driver's minimum if this is set too low or not specified. **You should generally not change this from the default value unless you experience audio pops.**
+  - `mode` (string): `Normal`, `Compat`, `Ringbuf`. Default is `Normal`.
 
-  - `compat` (bool): Forces this stream to use **Compat Mode**.
+  - `target_buffer_dur_ms` (u16): The target buffer size for all created low latency shared stream in **units of 0.1 milliseconds**. The tool will default to the driver's minimum if this is set too low or not specified. **You should generally not change this from the default value unless you experience audio pops.**
 
-  - `raw` (bool): Indicates this stream to use **Raw Mode**, which bypasses most APO.
+  - `raw` (bool): Indicates this stream to use **raw processing**, which bypasses most APO.
 
-  - `compat_buffer_len.<samplerate>` (i64): The target buffer size for shared stream in **units of 100 nanoseconds**. The tool/Windows will default to the driver's minimum if this is set too low or not specified. **This will help if you noticed audio pops after changing audio samplerate in shared mode.**
+  - `ring_buffer_len.<samplerate>` (u32): The target buffer length for the ring buffer in **audio frames** (not samples). For example, 340 means 340 frames (680 samples in 2-channel audio). **It's recommended to set a proper value in Ringbuf mode.**
+    - Note: The tool will automatically round this value *UP* to the nearest multiple of the driver’s fundamental period to ensure smooth streaming and prevent micro-glitches.
+
+  - `compat_buffer_len.<samplerate>` (i64): The target buffer size for shared stream in **100-nanosecond units**. This controls the size of the shared buffer the program actually sees in Compat mode. The tool/Windows will default to the driver’s minimum if this is set too low or not specified. **This can help fix audio pops that occur after changing the audio sample rate in Compat mode.**
 
 ## 🩺Troubleshooting
 Use this guide to diagnose and fix common audio issues.
@@ -136,27 +164,41 @@ Use this guide to diagnose and fix common audio issues.
 ### Audio is "Sliced" or in "Slow-Motion"
 **Phenomenon:** Sound is heavily distorted, stretched, or sounds like it's being "sliced" and played back slowly.
 
-**Cause:** This is the classic sign of a **Poll-driven** application running in **Normal Mode** (`compat = false`). The app's polling logic is fighting the event-driven buffer. This is commonly seen in **Unity** games.
+**Cause:** This is the classic sign of a **Poll-driven** application running in **small buffer**. The app's polling logic is fighting the event-driven buffer. This is commonly seen in **Unity** games.
 
-**Solution:** Set `compat = true` for the `[playback]` section.
+**Solution:** Try Compat or Ringbuf mode for the `[playback]` section.
+
+### No sound or crashes with a log
+**Phenomenon:** Completely silent, or simply crashes with `wasapi_relink` log provided.
+
+**Cause:** This is mostly because of a **Fixed-size** application running in **small buffer**. The app's mixing logic is waiting indefinitely or encountering math errors on the buffer. This is usually seen in **Rhythm** games.
+
+**Solution:** Try Ringbuf mode for the `[playback]` section.
 
 ### Good Audio with Occasional "Pops" or "Crackles"
 **Phenomenon:** Audio playback is at the correct speed and pitch, but you hear intermittent pops, clicks, or small tearing sounds.
 
 **Cause:** The buffer is **too small** for your system/software. Your CPU or the application cannot "feed" the audio driver new data fast enough, resulting in a buffer underrun.
 
-**Solutions (Try in order):** 
+**Solutions (Try either one):** 
 1. **Increase Buffer:** Slightly increase `target_buffer_dur_ms`. If your driver's minimum is 2ms (e.g., `20`), try `30` (3ms) or `40` (4ms) until the pops disappear.
 
-2. **Try Compat Mode:** Set `compat = true`. This effectively adds a buffer layer for the application (i.e., the standard buffer from normal Shared mode). In combination with the changes made by Compat mode, this can potentially resolve the issue.
+2. **Try Compat or Ringbuf Mode:** This effectively adds a buffer layer for the application (i.e., the standard buffer from normal Shared mode). In combination with the changes made by those modes, this can potentially resolve the issue.
 
 ### Audio Pop after changing samplerate in Windows settings
-**Phenomenon:** Audio playback is normal at samplerate A (e.g. 48000Hz), but pops at samplerate B (e.g. 96000 Hz).
+**Phenomenon:** Audio playback is normal at samplerate A (e.g. 48000Hz), but pops at samplerate B (e.g. 96000 Hz) in compat mode.
 
-**Possible solution:** Adjusting compat_buffer_len will help.
+**Cause:** In Compat mode, `compat_buffer_len` is mapped specifically to the active samplerate. If you switch the system samplerate but haven’t configured a buffer length for the new one, it falls back to a default value that might be too low for that specific rate.
 
-### Program won't start
-**Phenomenon:** The target program fails to start after loading the DLL.
+**Solution:** Explicitly add the new samplerate to your config. For example:
+```toml
+[playback]
+compat_buffer_len.48000 = 238350
+compat_buffer_len.96000 = 250000  # Add a specific value for 96kHz
+```
+
+### Program won't start at all
+**Phenomenon:** The target program fails to start after loading the DLL, and no log is given.
 
 **Cause:** This is usually a **file permission issue** — the DLL attempts to write its log file to a location where it lacks write access.
 It commonly occurs when the target executable resides under `Program Files` or other protected directories.
@@ -168,9 +210,9 @@ log_path = "C:\\Users\\Public\\wasapi_relink.log"
 ```
 If you don't need logging to file, you can also disable it with `only_log_stdout` :
 ```toml
-only_log_stdout = false
+only_log_stdout = true
 ```
-Or, you can entirely disable logging (not recommended):
+As a last resort, you can entirely disable logging (not recommended):
 ```toml
 log_level = "Never"
 ```
@@ -178,13 +220,13 @@ log_level = "Never"
 ## ⚠️Performance Warning: Logging & Audio Tearing
 The Windows audio engine is _extremely_ sensitive to timing.
 
- - **DO NOT** set `log_level` to `Debug` or `Trace` for normal use.
+ - **DO NOT** set `log_level` to `Debug` or `Trace` during normal use.
 
  - The high-frequency I/O (disk writing) from detailed logging **will** interfere with the audio thread, especially at low buffer sizes.
 
- - This interference ***will* cause audio tearing, pops, and stuttering**.
+ - This interference *can* cause **audio tearing, pops, and stuttering**.
 
- - ONLY use `Debug`/`Trace` if you are actively debugging the tool itself and you know what you are doing.
+ - **ONLY** use `Debug`/`Trace` if you are actively debugging the application and you know what you are doing.
 
 ## 🔬Deep Dive: Technical Implementation
 ### The "Myth" of External Low-Latency Activators
@@ -195,6 +237,37 @@ Previous tools([REAL](https://github.com/miniant-git/REAL), [LowAudioLatency](ht
  - **What they missed (The "Myth"):** They assumed lowering the hardware buffer was enough. **It isn't.** A poll-driven application will _still_ try to **prefill** its old 10ms buffer. The latency bottleneck just moves from the hardware to the application's own prefill.
 
  `wasapi_relink`'s **Compat Mode** solves _both_ problems: it triggers the hardware change and internally hooks the application to _deceive and modify its prefill_ to match the new, smaller hardware buffer.
+ 
+### The Size Mismatch: Why Ringbuf Mode Exists
+Even if you successfully force the audio engine into a low-latency period (e.g., 128 frames per cycle, roughly every 2.67ms at 48kHz), a fundamental scheduling mismatch remains between Windows and the application.
+
+**The Engine’s Rhythm:**
+
+In low-latency event-driven mode, Windows becomes an extremely fast, strict “pump”. It fires an event exactly every 128 frames (the requested period), and expects you to deliver exactly 128 frames of new data each time it wakes up. It has zero tolerance for variability.
+
+**The Application’s Rhythm:**
+
+Games, however, do not think in 128-frame chunks:
+
+- Rhythm Games / Fixed-block mixers: They mix audio in large, rigid chunks (e.g., 256, 512, or 1024 frames) dictated by their internal logic frame.
+
+- Poll-driven Engines (Unity, etc.): They operate in a tight while loop, calling `GetCurrentPadding` with fixed duration to see if *any* space is available, then dumping whatever they have.
+
+**The Direct Consequence:**
+
+If you let a game like these talk directly to a 128-frame low-latency engine buffer:
+
+**For Poll-driven games:** If the buffer length is shorter than the poll intreval, the game will unable to send samples, causing severe underrun.
+
+**For Fixed-block games:** If the buffer length is shorter than the mix chunk length, the audio engine may refuse to start.
+
+The `wasapi_relink` Ringbuf Solution:
+
+Ringbuf mode inserts a high-performance software decoupler between the audio engine and the application:
+
+**The Engine Side:** `wasapi_relink` completely takes over the Windows Event callback. It wakes up exactly every 128 frames, silently pops that exact amount from the Ringbuf, and feeds it to the hardware. The hardware never sees the game’s messy behavior.
+
+**The App Side:** The game is tricked into thinking it is talking to a much larger, traditional buffer. It writes its large 512-frame chunks or polls at its leisure into this safe zone.
 
 ## 🧩Implementation: The COM Wrapper Chain
 
@@ -208,7 +281,9 @@ Previous tools([REAL](https://github.com/miniant-git/REAL), [LowAudioLatency](ht
 
     3.1. **Execute (Compat Mode):** When the app calls `Activate` on the wrapped `IMMDevice`, wasapi_relink executes its core Compat Mode logic (creating the two clients) and returns _one_ wrapped `IAudioClient`.
 
-    3.2.**Execute (Normal Mode):** When the app calls `Initialize` on the wrapped `IAudioClient`, the Normal Mode logic is executed.
+    3.2. **Execute (Normal Mode):** When the app calls `Initialize` on the wrapped `IAudioClient`, the Normal Mode logic is executed.
+
+    3.2. **Execute (Ringbuf Mode):** When the app calls `Initialize` on the wrapped `IAudioClient`, it will enable event callback, setup low-latency stream, choose modes based on program behavior, and creates consumer thread.
 
 4. This wrapper chain continues all the way down to `IAudioRenderClient`, giving `wasapi_relink` full, transparent control over the entire audio stream lifecycle.
 
