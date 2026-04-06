@@ -3,12 +3,12 @@ English | [中文](./readme_zh-CN.md)
 
 `wasapi_relink` is a hook library that modifies the behavior of WASAPI (Windows Audio Session API) Shared streams, "grafting" them onto modern, low-latency interfaces to drastically minimize audio latency.
 
-## 🎯Purpose
+## Purpose
 Many applications and games use WASAPI's Shared mode for audio playback. While it offers good compatibility, this mode only allows for a minimum buffer size of 10ms, preventing further improvement in latency.
 
 `wasapi_relink` intercepts the application's audio requests and forces them to use much smaller buffers by leveraging the `IAudioClient3` interface, achieving a low-latency experience similar to Exclusive mode without sacrificing Shared mode's convenience.
 
-### ❗Reminder: Your Driver is Everything
+### Reminder: Your Driver is Everything
 This tool is 100% dependent on your audio driver. The `target_buffer_dur_ms` setting in config is a ***request***, not a *command*.
 
 Your audio driver reports a supported buffer range (i.e. `GetSharedModeEnginePeriod`), and `wasapi_relink` will clamp the request to fit within that range, this problem is most obvious when using Realtek onboard soundcards, see below.
@@ -19,15 +19,17 @@ Most stock Realtek audio drivers (the ones from the manufacturer) lock the buffe
 If your driver does this, wasapi_relink will have no effect, as it cannot request a buffer smaller than 10ms.
 
 #### The Solution
-You must uninstall the Realtek drivers and force Windows to install the generic "High Definition Audio Device" driver. This standard Microsoft driver typically allows a 2ms-10ms range, enabling `wasapi_relink` to successfully request a 2ms buffer.
+You must replace the Realtek driver with Windows generic "High Definition Audio Device" driver. This standard Microsoft driver typically allows a 2ms-10ms range, enabling `wasapi_relink` to successfully request a 2ms buffer.
 
 Or, use a professional soundcard or external audio interface that supports low-latency.
 
-## 🚀How It Works: The "Grafting"
+P.S.: Currently, there don't seem to be many sound cards that are compatible with Low Latency Shared mode. The best option right now is probably to use the USB dongle that comes with Windows' built-in USB 2.0 driver.
+
+## How It Works: The "Grafting"
 `wasapi_relink` operates in three distinct modes to handle different types of applications.
 
 ### Normal Mode (For modern apps)
-**Target:** Applications and games that use event‑driven (callback) WASAPI audio and already behave well.
+**Target:** Applications and games that use event‑driven (callback) WASAPI audio and behave well.
 
 **Method:**
 
@@ -50,7 +52,7 @@ Or, use a professional soundcard or external audio interface that supports low-l
 
 2. **Engine‑side effect:** According to [**Microsoft’s low‑latency documentation**](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/low-latency-audio#faq), when any application on an endpoint requests small buffers via `IAudioClient3`, the audio engine switches to that small period for all shared‑mode streams on the same endpoint. By keeping the low‑latency client alive, `wasapi_relink` forces the engine to run at the small period even though the “main” app client is using a larger buffer.
 
-3. **Prefill Deception:** Before `IAudioClient::Start`, many apps will write “silent” prefill data. `wasapi_relink` intercepts this via the wrapped `IAudioRenderClient`, then writes a smaller prefill (sized to the real engine period) into the hardware client.'
+3. **Prefill Deception:** Before `IAudioClient::Start`, many apps will write “silent” prefill data. `wasapi_relink` intercepts this via the wrapped `IAudioRenderClient`, then writes a smaller prefill (sized to the real engine period) into the hardware client, non-silent data won't be affected.'
 
 **Result:** The app continues to work as if it had its original large buffer.
 - **Worst-case:** Latency is doubled comparing to normal mode (the sum of the pre-filled buffer and the device buffer).
@@ -71,17 +73,16 @@ Or, use a professional soundcard or external audio interface that supports low-l
 ```
 hardware engine → ringbuf consumer thread → app callback
 ```
-4. Prefill deception still applies.
+4. All silent data before `Start()` will be discarded.
+5. For callback-based programs, calling `Start()` will trigger a callback in advance, causing the program to write data beforehand.
 
 **Result:** The app just sees a large, friendly WASAPI client, fully isolated from the engine’s real timing and buffer size, which works even with “broken” timing patterns (fixed‑size blocks, sleep‑based loops, etc.).
 
-## 🔧How to Use (Injection)
+## How to Use (Injection)
 This library **does not** include its own DLL injector. You must use an external tool or [stub generator](https://github.com/namazso/dll-proxy-generator).
 
 ### Recommended Method: Special K
-This library is designed to work seamlessly with **Special K**.
-
-It is recommended to load `wasapi_relink.dll` as a Special K "plug-in" (lazy mode).
+It is recommended to load `wasapi_relink.dll` as a **Special K** "plug-in" (lazy mode).
 
 **Built-in Compatibility:** `wasapi_relink` actively detects and **skips** hooking Special K's own audio requests, ensuring SK's sound related features are not affected.
 
@@ -91,15 +92,13 @@ An additional purpose of this tool is to act as a "auxiliary" library if the aud
 No complex injection tools are needed. Simply, early in your program’s startup, explicitly load this DLL with `LoadLibrary("wasapi_relink.dll")`. Its hooking behavior is automatically performed when the DLL is loaded, thereby "transparently" providing low-latency features to your existing audio library.
 
 ### Reminder on using stub generator
-To facilitate use with stub generators, `wasapi_relink.dll` additionally exports a blank function named `proxy`.
+To facilitate use with stub generators, `wasapi_relink.dll` additionally exports a blank C function named `proxy`.
 
 This function does nothing on its own; it exists only as a definitive "entry point".
 
 **DO NOT use `ole32.dll` when generating DLL stubs.** Doing so can cause infinite recursion during `LoadLibrary`/COM activation and lead to unstable or hard-to-debug behavior (e.g., repeated loader calls, crashes, or the target process hanging).
 
-**Why:** `ole32.dll` is heavily involved in COM activation and in-process marshaling. Creating stubs that forward or re-export COM/ole32 entry points can easily create circular calls where the loader repeatedly invokes the same activation paths.
-
-## ⚙️Configuration (`redirect_config.toml`)
+## Configuration (`redirect_config.toml`)
 The configuration file `redirect_config.toml` **must** be placed in the same directory(or working directory) as the DLL. If an entry is not specified, default value will be used.
 ```toml
 # Path for the log file. "" (empty string) defaults to the working directory.
@@ -158,7 +157,7 @@ compat_buffer_len.96000 = 238350
 
   - `compat_buffer_len.<samplerate>` (i64): The target buffer size for shared stream in **100-nanosecond units**. This controls the size of the shared buffer the program actually sees in Compat mode. The tool/Windows will default to the driver’s minimum if this is set too low or not specified. **This can help fix audio pops that occur after changing the audio sample rate in Compat mode.**
 
-## 🩺Troubleshooting
+## Troubleshooting
 Use this guide to diagnose and fix common audio issues.
 
 ### Audio is "Sliced" or in "Slow-Motion"
@@ -217,7 +216,7 @@ As a last resort, you can entirely disable logging (not recommended):
 log_level = "Never"
 ```
 
-## ⚠️Performance Warning: Logging & Audio Tearing
+## Performance Warning: Logging & Audio Tearing
 The Windows audio engine is _extremely_ sensitive to timing.
 
  - **DO NOT** set `log_level` to `Debug` or `Trace` during normal use.
@@ -226,9 +225,11 @@ The Windows audio engine is _extremely_ sensitive to timing.
 
  - This interference *can* cause **audio tearing, pops, and stuttering**.
 
+ - Also, most of the time your log will be flooded with a large number of repeated calls.
+
  - **ONLY** use `Debug`/`Trace` if you are actively debugging the application and you know what you are doing.
 
-## 🔬Deep Dive: Technical Implementation
+## Deep Dive: Technical Implementation
 ### The "Myth" of External Low-Latency Activators
 Previous tools([REAL](https://github.com/miniant-git/REAL), [LowAudioLatency](https://github.com/spddl/LowAudioLatency) and similar projects) attempted to solve this by running a _separate_ low-latency `IAudioClient3` application in the background.
 
@@ -261,15 +262,15 @@ If you let a game like these talk directly to a 128-frame low-latency engine buf
 
 **For Fixed-block games:** If the buffer length is shorter than the mix chunk length, the audio engine may refuse to start.
 
-The `wasapi_relink` Ringbuf Solution:
+**The `wasapi_relink` Ringbuf Solution:**
 
 Ringbuf mode inserts a high-performance software decoupler between the audio engine and the application:
 
-**The Engine Side:** `wasapi_relink` completely takes over the Windows Event callback. It wakes up exactly every 128 frames, silently pops that exact amount from the Ringbuf, and feeds it to the hardware. The hardware never sees the game’s messy behavior.
+**The Engine Side:** `wasapi_relink` completely takes over the Windows Event callback. It wakes up exactly every 128 frames, quietly transfers the corresponding amount of data from the ring buffer to the hardware, and promptly notifies the program to replenish the data via callback (if any) when the data is about to run out. The hardware never sees the game’s messy behavior.
 
-**The App Side:** The game is tricked into thinking it is talking to a much larger, traditional buffer. It writes its large 512-frame chunks or polls at its leisure into this safe zone.
+**The App Side:** The game is tricked into thinking it is talking to a much larger, traditional buffer. It writes its large fixed-frame chunks or polls at its leisure into this safe zone.
 
-## 🧩Implementation: The COM Wrapper Chain
+## Implementation: The COM Wrapper Chain
 
 `wasapi_relink` does not use simple VTable hooking. It hooks at the root of the COM audio system to ensure 100% capture.
 
@@ -279,11 +280,11 @@ Ringbuf mode inserts a high-performance software decoupler between the audio eng
 
 3. **Propagate:** When the app requests device on this wrapper, `wasapi_relink` returns a wrapped `IMMDevice`.
 
-    3.1. **Execute (Compat Mode):** When the app calls `Activate` on the wrapped `IMMDevice`, wasapi_relink executes its core Compat Mode logic (creating the two clients) and returns _one_ wrapped `IAudioClient`.
+    3.1. **Compat Mode:** When the app calls `Activate` on the wrapped `IMMDevice`, `wasapi_relink` executes its core Compat Mode logic (creating the two clients) and returns _one_ wrapped `IAudioClient`.
 
-    3.2. **Execute (Normal Mode):** When the app calls `Initialize` on the wrapped `IAudioClient`, the Normal Mode logic is executed.
+    3.2. **Normal Mode:** When the app calls `Initialize` on the wrapped `IAudioClient`, the Normal Mode logic is executed.
 
-    3.2. **Execute (Ringbuf Mode):** When the app calls `Initialize` on the wrapped `IAudioClient`, it will enable event callback, setup low-latency stream, choose modes based on program behavior, and creates consumer thread.
+    3.2. **Ringbuf Mode:** When the app calls `Initialize`, it will enable event callback, setup low-latency stream, choose modes based on program behavior, and creates consumer thread.
 
 4. This wrapper chain continues all the way down to `IAudioRenderClient`, giving `wasapi_relink` full, transparent control over the entire audio stream lifecycle.
 
@@ -292,6 +293,8 @@ In **Compat Mode**, capture (mic) streams are simply forwarded. This *is* intent
 
 1. Mic latency is far less critical in Shared mode compared to effects or network latency. Due to the nature of capture streams, which don’t require a silent pre-fill buffer in their interaction with the driver, triggering Windows’ special behavior is by itself sufficient to reduce latency.
 2. Users with true low-latency input needs are already using `ASIO` or `WASAPI Exclusive` mode, which this tool does not target.
+
+Capture stream in ringbuf mode is still WIP, please don't use it.
 
 ---
 ### **Disclaimer:**
