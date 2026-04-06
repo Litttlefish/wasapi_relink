@@ -176,7 +176,7 @@ compat_buffer_len.96000 = 238350
 
   - `target_buffer_dur_ms` (u16): The target buffer size for all created low latency shared stream in **units of 0.1 milliseconds**. The tool will default to the driver's minimum if this is set too low or not specified. **You should generally not change this from the default value unless you experience audio pops.**
 
-  - `raw` (bool): Indicates this stream to use **raw processing**, which bypasses most APO.
+  - `raw` (bool): Indicates this stream to use **raw processing**, which bypasses most APO. Does nothing when mode is `Bypass`.
 
   - `ring_buffer_len.<samplerate>` (u32): The target buffer length for the ring buffer in **audio frames** (not samples). For example, 340 means 340 frames (680 samples in 2-channel audio). **It's recommended to set a proper value in Ringbuf mode.**
     - Note: The tool will automatically round this value *UP* to the nearest multiple of the driver’s fundamental period to ensure smooth streaming and prevent micro-glitches.
