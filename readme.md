@@ -32,7 +32,7 @@ P.S.: Currently, there don't seem to be many sound cards that are compatible wit
 
 ## How It Works: The "Grafting"
 
-`wasapi_relink` operates in three distinct modes to handle different types of applications.
+`wasapi_relink` operates in four distinct modes to handle different types of applications.
 
 ### Normal Mode (For modern apps)
 
@@ -148,7 +148,7 @@ mode = "Ringbuf"
 
 # (Ringbuf mode exclusive, Optional) Assign a ring buffer length (in audio frames) to the corresponding samplerate.
 # The number will be automatically rounded UP to align with the driver's fundamental period for optimal performance.
-ring_buffer_len.48000 = 340
+ring_buffer_len.48000 = 340 # about 7ms buffer
 
 # (Compat mode exclusive, Optional) Assign a shared stream buffer duration (in 100-nanosecond units) to the corresponding samplerate.
 # The number will be directly used as the inner shared buffer, and will be clamped by Windows if set too low.
@@ -327,7 +327,7 @@ Ringbuf mode inserts a high-performance software decoupler between the audio eng
 
     3.2. **Normal Mode:** When the app calls `Initialize` on the wrapped `IAudioClient`, the Normal Mode logic is executed.
 
-    3.2. **Ringbuf Mode:** When the app calls `Initialize`, it will enable event callback, setup low-latency stream, choose modes based on program behavior, and creates consumer thread.
+    3.3. **Ringbuf Mode:** When the app calls `Initialize`, it will enable event callback, setup low-latency stream, choose modes based on program behavior, and creates consumer thread.
 
 4. This wrapper chain continues all the way down to `IAudioRenderClient`, giving `wasapi_relink` full, transparent control over the entire audio stream lifecycle.
 
