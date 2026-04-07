@@ -986,19 +986,12 @@ impl IAudioClient3_Impl for RedirectAudioClient_Impl {
     }
 }
 
-#[repr(u8)]
-enum TrickState {
-    Tricking,
-    Filled,
-    Transparent,
-}
-
 #[implement(IAudioClient3)]
 struct RedirectCompatAudioClient {
     inner: IAudioClient3,
     hooker: IAudioClient3,
     info: RedirectClientInfo,
-    trick: Arc<AtomicU8>,
+    trick: Arc<AtomicBool>,
     align: Cell<u32>,
 }
 
@@ -1008,7 +1001,7 @@ impl RedirectCompatAudioClient {
             inner,
             hooker,
             info: RedirectClientInfo::new(dataflow),
-            trick: AtomicU8::default().into(),
+            trick: AtomicBool::new(true).into(),
             align: 0.into(),
         }
     }
@@ -1149,8 +1142,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
             self.info.dataflow
         );
         unsafe {
-            self.trick
-                .store(TrickState::Transparent as u8, Ordering::Relaxed);
+            self.trick.store(false, Ordering::Relaxed);
             _ = self.hooker.Start();
             self.inner.Start()
         }
@@ -1173,8 +1165,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
             self.info.dataflow
         );
         unsafe {
-            self.trick
-                .store(TrickState::Tricking as u8, Ordering::Relaxed);
+            self.trick.store(true, Ordering::Relaxed);
             _ = self.hooker.Reset();
             self.inner.Reset()
         }
@@ -1202,17 +1193,18 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     let hooker_buffer_len = self.hooker.GetBufferSize().unwrap_or_else(|_| {
                         self.hooker_info().current_buffer_len + self.hooker_info().fundamental
                     });
+                    let inner_buffer_len = self.inner.GetBufferSize()?;
                     let service: IAudioRenderClient = RedirectCompatAudioRenderClient {
                         inner: self.inner.GetService::<IAudioRenderClient>()?,
                         trick_buffer: vec![
                             0;
-                            hooker_buffer_len as usize * self.align.get() as usize
+                            inner_buffer_len as usize * self.align.get() as usize
                         ]
                         .into_boxed_slice()
                         .into(),
                         trick: self.trick.clone(),
                         align: AudioAlign::new(self.align.get()),
-                        hooker_buffer_len,
+                        buffer_len: (inner_buffer_len, hooker_buffer_len),
                     }
                     .into();
 
@@ -1330,15 +1322,18 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
             unsafe { self.inner.SetClientProperties(&properties) }?;
         }
         self.align.set(unsafe { (*pformat).nBlockAlign as u32 });
-        if periodinframes != 0 {
+        let client = if periodinframes != 0 {
             info!(
                 "RedirectCompatAudioClient::InitializeSharedAudioStream() called, direction: {:?}",
                 self.info.dataflow
             );
             info!("Original period: {periodinframes}");
-        }
+            &self.inner
+        } else {
+            &self.hooker
+        };
         unsafe {
-            self.inner.InitializeSharedAudioStream(
+            client.InitializeSharedAudioStream(
                 streamflags,
                 self.hooker_info().current_buffer_len,
                 pformat,
@@ -1352,9 +1347,9 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
 struct RedirectCompatAudioRenderClient {
     inner: IAudioRenderClient,
     trick_buffer: UnsafeCell<Box<[u8]>>,
-    trick: Arc<AtomicU8>,
+    trick: Arc<AtomicBool>,
     align: AudioAlign<u32>,
-    hooker_buffer_len: u32,
+    buffer_len: (u32, u32),
 }
 impl RedirectCompatAudioRenderClient {
     #[inline]
@@ -1370,7 +1365,7 @@ impl RedirectCompatAudioRenderClient {
 }
 impl IAudioRenderClient_Impl for RedirectCompatAudioRenderClient_Impl {
     fn GetBuffer(&self, numframesrequested: u32) -> windows::core::Result<*mut u8> {
-        if self.trick.load(Ordering::Relaxed) != TrickState::Transparent as u8 {
+        if self.trick.load(Ordering::Relaxed) {
             info!(
                 "RedirectCompatAudioRenderClient::GetBuffer() called, requested: {numframesrequested}, tricking"
             );
@@ -1381,37 +1376,26 @@ impl IAudioRenderClient_Impl for RedirectCompatAudioRenderClient_Impl {
     }
 
     fn ReleaseBuffer(&self, numframeswritten: u32, dwflags: u32) -> windows::core::Result<()> {
-        if numframeswritten == 0 {
-            warn!("no data written in this release call, overflow may happen!");
-            return unsafe { self.inner.ReleaseBuffer(0, 2) };
-        }
-        match unsafe { transmute::<u8, TrickState>(self.trick.load(Ordering::Relaxed)) } {
-            TrickState::Tricking => {
-                info!(
-                    "RedirectCompatAudioRenderClient::ReleaseBuffer() called, written: {numframeswritten}, tricking"
-                );
-                info!(
-                    "filling silent buffer, {} samples filled",
-                    self.hooker_buffer_len
-                );
-                self.trick
-                    .store(TrickState::Filled as u8, Ordering::Relaxed);
-                self.apply_data(self.hooker_buffer_len, dwflags)
-            }
-            TrickState::Filled => {
-                info!(
-                    "RedirectCompatAudioRenderClient::ReleaseBuffer() called, written: {numframeswritten}"
-                );
-                if dwflags == 2 {
+        if self.trick.load(Ordering::Relaxed) {
+            info!(
+                "RedirectCompatAudioRenderClient::ReleaseBuffer() called, written: {numframeswritten}"
+            );
+            if dwflags == 2 {
+                if numframeswritten == self.buffer_len.0 {
+                    info!("filling silent buffer, {} frames filled", self.buffer_len.1);
+                    self.apply_data(self.buffer_len.1, dwflags)
+                } else {
                     info!("already filled, discarding");
                     Ok(())
-                } else {
-                    self.apply_data(numframeswritten, dwflags)
                 }
+            } else {
+                self.apply_data(numframeswritten, dwflags)
             }
-            TrickState::Transparent => unsafe {
-                self.inner.ReleaseBuffer(numframeswritten, dwflags)
-            },
+        } else {
+            if numframeswritten == 0 {
+                warn!("no data written in this release call, overflow may happen!");
+            }
+            unsafe { self.inner.ReleaseBuffer(numframeswritten, dwflags) }
         }
     }
 }
@@ -1867,17 +1851,24 @@ fn callback(
         spin_loop();
     }
     while !thread_info.1.load(Ordering::Relaxed) {
-        let (read_len, pad) = (buffer.occupied_len(), unsafe {
-            client.GetCurrentPadding().unwrap()
-        });
-        if read_len == 0 {
+        if buffer.is_empty() {
+            let pad = unsafe { client.GetCurrentPadding().unwrap() };
             if pad == 0 {
                 warn!("buffer is empty, underflow may happen!");
             } else {
                 debug!("mid-buffer empty, data in client buffer: {pad}");
             }
+            unsafe {
+                if let Some(handle) = thread_info.2.load(Ordering::Relaxed).as_mut() {
+                    SetEvent(HANDLE(handle)).ok();
+                }
+                WaitForSingleObject(thread_info.0, INFINITE);
+            }
+            continue;
         }
-        let write_len = align.bytes_to_frames(read_len).min(real_len - pad as usize);
+        let read_len = align.bytes_to_frames(buffer.occupied_len());
+        let write_len =
+            read_len.min(real_len - unsafe { client.GetCurrentPadding().unwrap() } as usize);
         let slice: &mut [u8] = unsafe {
             from_raw_parts_mut(
                 inner.GetBuffer(write_len as u32).unwrap(),
