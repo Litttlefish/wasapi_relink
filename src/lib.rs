@@ -1632,8 +1632,6 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
 
                         let align = self.align.get().as_usize();
 
-                        let period = self.inner_info().current_buffer_len as usize;
-
                         let thread = spawn(move || {
                             let app_thread = app_thread;
                             let mut task_index = 0u32;
@@ -1669,7 +1667,6 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                                 info.consumer,
                                 client_ref,
                                 align,
-                                period,
                             );
                             if let Some(handle) = mmcss_handle {
                                 unsafe { AvRevertMmThreadCharacteristics(handle) }.ok();
@@ -1863,7 +1860,6 @@ fn callback(
     mut buffer: CachingCons<Arc<HeapRb<u8>>>,
     client: &IAudioClient3,
     align: AudioAlign<usize>,
-    _inner_duration: usize,
 ) {
     let real_len = unsafe { client.GetBufferSize().unwrap() } as usize;
     let inner = unsafe { client.GetService::<IAudioRenderClient>().unwrap() };
@@ -1882,7 +1878,7 @@ fn callback(
             }
         }
         let write_len = align.bytes_to_frames(read_len).min(real_len - pad as usize);
-        let slice = unsafe {
+        let slice: &mut [u8] = unsafe {
             from_raw_parts_mut(
                 inner.GetBuffer(write_len as u32).unwrap(),
                 align.frames_to_bytes(write_len),
