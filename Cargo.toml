@@ -21,10 +21,11 @@ windows = { version = "0.62.*", features = [
 log = "0.4.*"
 retour = "0.4.0-alpha.4"
 windows-core = "0.62.*"
-flexi_logger = "0.31.*"
+flexi_logger = { version = "0.31.*", features = ["async"] }
 serde = { version = "1.*", features = ["derive"] }
 toml = "1.*"
 ringbuf = "0.*"
+num-traits = "0.2.*"
 # mimalloc = { version = "*", features = ["v3"] }
 # uuid = { version = "1.20.0", features = ["v4"] }
 # min_hook_rs = "2.*"

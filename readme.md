@@ -87,7 +87,7 @@ hardware engine → ringbuf consumer thread → app callback
 ```
 
 1. All silent data before `Start()` will be discarded.
-2. For callback-based programs, calling `Start()` will trigger a callback in advance, causing the program to write data beforehand.
+2. After `Start()`, the callback thread spin-waits until the first data chunk arrives in the ring buffer, and then turns into normal block-wait afterward.
 
 **Result:** The app just sees a large, friendly WASAPI client, fully isolated from the engine’s real timing and buffer size, which works even with “broken” timing patterns (fixed‑size blocks, sleep‑based loops, etc.).
 
