@@ -265,7 +265,7 @@ The Windows audio engine is *extremely* sensitive to timing.
 
 - This interference *can* cause **audio tearing, pops, and stuttering**.
 
-- Also, most of the time your log will be flooded with a large number of repeated calls.
+- While asynchronous logging systems reduce the probability of popping sounds, your logs will be flooded with numerous function calls, consuming storage space.
 
 - **ONLY** use `Debug`/`Trace` if you are actively debugging the application and you know what you are doing.
 
@@ -309,7 +309,7 @@ If you let a game like these talk directly to a 128-frame low-latency engine buf
 
 Ringbuf mode inserts a high-performance software decoupler between the audio engine and the application:
 
-**The Engine Side:** `wasapi_relink` completely takes over the Windows Event callback. It wakes up exactly every 128 frames, quietly transfers the corresponding amount of data from the ring buffer to the hardware, and promptly notifies the program to replenish the data via callback (if any) when the data is about to run out. The hardware never sees the game’s messy behavior.
+**The Engine Side:** `wasapi_relink` completely takes over the Windows Event callback. It wakes up exactly every 128 frames, quietly transfers the corresponding amount of data from the ring buffer to the hardware, and notifies the program to replenish the data via callback (if any). The hardware never sees the game’s messy behavior.
 
 **The App Side:** The game is tricked into thinking it is talking to a much larger, traditional buffer. It writes its large fixed-frame chunks or polls at its leisure into this safe zone.
 
