@@ -521,6 +521,16 @@ macro_rules! impl_boilerplate {
     }
 }
 
+macro_rules! drop_boilerplate {
+    ($struct:ty) => {
+        impl Drop for $struct {
+            fn drop(&mut self) {
+                debug_tagged!(@self, "Client dropped")
+            }
+        }
+    };
+}
+
 #[repr(transparent)]
 #[implement(IMMDevice, IMMEndpoint)]
 struct RedirectDevice {
@@ -981,6 +991,8 @@ impl IAudioClient3_Impl for RedirectAudioClient_Impl {
     }
 }
 
+drop_boilerplate!(RedirectAudioClient);
+
 #[implement(IAudioClient3)]
 struct RedirectCompatAudioClient {
     inner: IAudioClient3,
@@ -1217,6 +1229,7 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
         }
     }
 }
+drop_boilerplate!(RedirectCompatAudioClient);
 
 #[implement(IAudioRenderClient)]
 struct RedirectCompatAudioRenderClient {
@@ -1612,6 +1625,7 @@ impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
         }
     }
 }
+drop_boilerplate!(RedirectRingbufAudioClient);
 
 fn callback(
     thread_info: (HANDLE, Arc<AtomicBool>, Arc<AtomicPtr<c_void>>),
