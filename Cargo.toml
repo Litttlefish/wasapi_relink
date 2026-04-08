@@ -14,7 +14,6 @@ windows = { version = "0.62.*", features = [
     "Win32_Security",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_SystemServices",
-    "Win32_Media_Audio_DirectSound",
     "Win32_Media_Audio_Endpoints",
 ] }
 log = "0.4.*"

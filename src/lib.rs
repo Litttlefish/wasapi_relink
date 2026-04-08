@@ -23,7 +23,7 @@ use std::thread::{JoinHandle, spawn};
 use windows::{
     Win32::{
         Foundation::*,
-        Media::Audio::{DirectSound::*, *},
+        Media::Audio::*,
         System::Com::{StructuredStorage::*, *},
         System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
         System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH},
@@ -589,22 +589,6 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
                         ClientMode::Bypass => inner,
                     };
                     assign(ppinterface, proxy_unknown)
-                }
-                IDirectSound::IID | IDirectSound8::IID => {
-                    error!("The program is using DSound, tool won't work!");
-                    assign(
-                        ppinterface,
-                        self.inner
-                            .Activate::<IDirectSound8>(dwclsctx, Some(pactivationparams))?,
-                    )
-                }
-                IDirectSoundCapture::IID => {
-                    error!("The program is using DSound, tool won't work!");
-                    assign(
-                        ppinterface,
-                        self.inner
-                            .Activate::<IDirectSoundCapture>(dwclsctx, Some(pactivationparams))?,
-                    )
                 }
                 _ => (self.inner.vtable().Activate)(
                     self.inner.as_raw(),
