@@ -251,8 +251,7 @@ macro_rules! error_tagged {
     ($tag:expr, $($arg:tt)+) => { error!(target: $tag.as_ref(), $($arg)+) };
 }
 
-#[allow(clippy::redundant_closure)]
-static CONFIG: LazyLock<RedirectConfig> = LazyLock::new(|| RedirectConfig::load());
+static CONFIG: LazyLock<RedirectConfig> = LazyLock::new(RedirectConfig::load);
 
 static PLAYBACK_ID: AtomicU16 = AtomicU16::new(0);
 static CAPTURE_ID: AtomicU16 = AtomicU16::new(0);
@@ -311,7 +310,7 @@ unsafe extern "system" fn hooked_cocreateinstance(
     unsafe {
         let ret = HOOK_CO_CREATE_INSTANCE.call(rclsid, p_outer, dwcls_context, riid, ppv);
         if *riid == IMMDeviceEnumerator::IID {
-            LOG_SETUP.call_once(|| setup());
+            LOG_SETUP.call_once(setup);
             if ret.is_ok() {
                 if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
                     && !thread_desc.is_empty()
@@ -351,7 +350,7 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
             presults,
         );
         if *clsid == MMDeviceEnumerator {
-            LOG_SETUP.call_once(|| setup());
+            LOG_SETUP.call_once(setup);
             if hr.is_ok() {
                 if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
                     && !thread_desc.is_empty()
