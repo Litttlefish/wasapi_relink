@@ -23,8 +23,7 @@ use std::thread::{JoinHandle, spawn};
 use windows::{
     Win32::{
         Foundation::*,
-        Media::Audio::{DirectSound::*, Endpoints::*, *},
-        Media::DirectShow::*,
+        Media::Audio::{DirectSound::*, *},
         System::Com::{StructuredStorage::*, *},
         System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
         System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH},
@@ -38,6 +37,53 @@ use windows::{
     core::*,
 };
 
+static LOG_SETUP: Once = Once::new();
+fn setup() {
+    spawn(|| {
+        let logger = Logger::with(<ConfigLogLevel as Into<LevelFilter>>::into(
+            CONFIG.log_level,
+        ))
+        .format(formatter)
+        .write_mode(WriteMode::Async);
+        let handle = if !CONFIG.only_log_stdout {
+            logger
+                .log_to_file({
+                    let spec = FileSpec::default()
+                        .basename("wasapi_relink")
+                        .suppress_timestamp();
+                    if let Some(path) = &CONFIG.log_path
+                        && path.is_dir()
+                    {
+                        spec.directory(path)
+                    } else {
+                        spec
+                    }
+                })
+                .duplicate_to_stdout(Duplicate::All)
+        } else {
+            logger.log_to_stdout()
+        }
+        .start()
+        .expect("unable to setup logger");
+        LOGGER_HANDLE.set(handle).ok();
+        info!(
+            "Attempting to load config from working directory: {}",
+            std::env::current_dir().map_or_else(
+                |e| format!("unknown, err: {e}"),
+                |path| path.display().to_string()
+            )
+        );
+        match CONFIG.source {
+            ConfigSource::Success => info!("Config loaded!"),
+            ConfigSource::NoParse => {
+                warn!("Unable to parse config, using default values")
+            }
+            ConfigSource::NoFile => {
+                info!("Config file not found, using default values")
+            }
+        }
+    });
+}
 static LOGGER_HANDLE: OnceLock<LoggerHandle> = OnceLock::new();
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
@@ -95,13 +141,13 @@ impl RedirectConfig {
             Self::new_with_source(ConfigSource::NoFile)
         }
     }
-    #[inline]
     fn new_with_source(source: ConfigSource) -> Self {
         Self {
             source,
             ..Self::default()
         }
     }
+    #[inline]
     fn get(&self, dataflow: DeviceDataFlow) -> &ClientConfig {
         match dataflow {
             DeviceDataFlow::Capture => &self.capture,
@@ -228,17 +274,6 @@ type FnCoCreateInstanceEx = unsafe extern "system" fn(
     *mut MULTI_QI,
 ) -> HRESULT;
 
-// unsafe extern "system" fn local_cocreateinstance(
-//     rclsid: *const windows::core::GUID,
-//     punkouter: *mut core::ffi::c_void,
-//     dwclscontext: CLSCTX,
-//     riid: *const windows::core::GUID,
-//     ppv: *mut *mut core::ffi::c_void,
-// ) -> windows::core::HRESULT {
-//     link!("ole32.dll" "system" fn CoCreateInstance(rclsid : *const windows::core::GUID, punkouter : * mut core::ffi::c_void, dwclscontext : CLSCTX, riid : *const windows::core::GUID, ppv : *mut *mut core::ffi::c_void) -> windows::core::HRESULT);
-//     unsafe { CoCreateInstance(rclsid, punkouter.param().abi(), dwclscontext, riid, ppv) }
-// }
-
 const LIB_NAME: PCWSTR = w!("ole32.dll");
 const CO_CREATE: PCSTR = s!("CoCreateInstance");
 const CO_CREATE_EX: PCSTR = s!("CoCreateInstanceEx");
@@ -276,8 +311,8 @@ unsafe extern "system" fn hooked_cocreateinstance(
     unsafe {
         let ret = HOOK_CO_CREATE_INSTANCE.call(rclsid, p_outer, dwcls_context, riid, ppv);
         if *riid == IMMDeviceEnumerator::IID {
+            LOG_SETUP.call_once(|| setup());
             if ret.is_ok() {
-                debug!("CoCreateInstance CLSCTX: {dwcls_context:?}");
                 if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
                     && !thread_desc.is_empty()
                     && let Ok(name) = thread_desc.to_string()
@@ -285,15 +320,13 @@ unsafe extern "system" fn hooked_cocreateinstance(
                 {
                     trace!("Skipping SpecialK CoCreateInstance calls, thread name: {name}");
                 } else {
-                    debug!(
-                        "!!! Intercepted IMMDeviceEnumerator creation via CoCreateInstance, returning proxy !!!"
-                    );
+                    debug!("Intercepted IMMDeviceEnumerator creation via CoCreateInstance");
                     let proxy_enumerator: IMMDeviceEnumerator =
                         RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(*ppv)).into();
                     *ppv = proxy_enumerator.into_raw();
                 }
             } else {
-                error!("CoCreateInstance call failed with HRESULT: {ret}")
+                error!("CoCreateInstance failed with HRESULT: {ret}")
             }
         }
         ret
@@ -318,8 +351,8 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
             presults,
         );
         if *clsid == MMDeviceEnumerator {
+            LOG_SETUP.call_once(|| setup());
             if hr.is_ok() {
-                debug!("CoCreateInstanceEx CLSCTX: {dwclsctx:?}");
                 if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
                     && !thread_desc.is_empty()
                     && let Ok(name) = thread_desc.to_string()
@@ -329,9 +362,7 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
                 } else {
                     for qi in from_raw_parts_mut(presults, dwcount as usize) {
                         if *qi.pIID == IMMDeviceEnumerator::IID && qi.hr.is_ok() {
-                            debug!(
-                                "!!! Intercepted IMMDeviceEnumerator via CoCreateInstanceEx, replacing with proxy !!!"
-                            );
+                            debug!("Intercepted IMMDeviceEnumerator via CoCreateInstanceEx");
                             let proxy_enumerator: IMMDeviceEnumerator =
                                 RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(
                                     qi.pItf.take().unwrap_unchecked().into_raw(),
@@ -342,7 +373,7 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
                     }
                 }
             } else {
-                error!("CoCreateInstanceEx call failed with HRESULT: {hr}")
+                error!("CoCreateInstanceEx failed with HRESULT: {hr}")
             }
         }
         hr
@@ -369,51 +400,6 @@ impl IMMDeviceCollection_Impl for RedirectDeviceCollection_Impl {
 #[inline]
 unsafe fn assign<I: Interface>(ptr: *mut *mut c_void, component: I) -> windows::core::Result<()> {
     unsafe { component.query(&I::IID, ptr).ok() }
-}
-
-macro_rules! boilerplate {
-    (
-        $iid:expr,
-        $ptr:expr,
-        $self:ident,
-        [
-            $($interface:ty),* $(,)?
-        ]
-    ) => {
-        match $iid {
-            $(
-                <$interface>::IID => {
-                    unsafe { assign($ptr, $self.inner.GetService::<$interface>()?) }
-                },
-            )*
-            _ => {
-                error!("Called unimplemented service!");
-                Err(E_NOINTERFACE.into())
-            },
-        }
-    };
-    (
-        $iid:expr,
-        $ptr:expr,
-        $self:ident,
-        $dwclsctx:expr,
-        $pactivationparams:expr,
-        [
-            $($interface:ty),* $(,)?
-        ]
-    ) => {
-        match $iid {
-            $(
-                <$interface>::IID => {
-                    assign($ptr, $self.inner.Activate::<$interface>($dwclsctx, $pactivationparams)?)
-                },
-            )*
-            _ => {
-                error!("Called unimplemented object!");
-                Err(E_NOINTERFACE.into())
-            },
-        }
-    };
 }
 
 macro_rules! impl_boilerplate {
@@ -604,11 +590,6 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
                     };
                     assign(ppinterface, proxy_unknown)
                 }
-                IAudioSessionManager::IID | IAudioSessionManager2::IID => assign(
-                    ppinterface,
-                    self.inner
-                        .Activate::<IAudioSessionManager2>(dwclsctx, Some(pactivationparams))?,
-                ),
                 IDirectSound::IID | IDirectSound8::IID => {
                     error!("The program is using DSound, tool won't work!");
                     assign(
@@ -625,19 +606,14 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
                             .Activate::<IDirectSoundCapture>(dwclsctx, Some(pactivationparams))?,
                     )
                 }
-                iid => boilerplate!(
-                    iid,
-                    ppinterface,
-                    self,
+                _ => (self.inner.vtable().Activate)(
+                    self.inner.as_raw(),
+                    riid,
                     dwclsctx,
-                    Some(pactivationparams),
-                    [
-                        IAudioEndpointVolume,
-                        IAudioMeterInformation,
-                        IBaseFilter,
-                        IDeviceTopology
-                    ]
-                ),
+                    pactivationparams,
+                    ppinterface,
+                )
+                .ok(),
             }
         }
     }
@@ -916,21 +892,10 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
     fn GetService(&self, riid: *const GUID, ppv: *mut *mut c_void) -> windows::core::Result<()> {
         let iid = unsafe { *riid };
         debug_tagged!(@self, "GetService called, iid: {iid:?}");
-        boilerplate!(
-            iid,
-            ppv,
-            self,
-            [
-                IAudioSessionControl,
-                IAudioRenderClient,
-                IAudioCaptureClient,
-                IAudioClientDuckingControl,
-                IAudioClock,
-                IChannelAudioVolume,
-                ISimpleAudioVolume,
-                IAudioStreamVolume
-            ]
-        )
+        unsafe {
+            (self.inner.cast::<IAudioClient>()?.vtable().GetService)(self.inner.as_raw(), riid, ppv)
+        }
+        .ok()
     }
 }
 
@@ -1150,21 +1115,14 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     service.query(&IAudioRenderClient::IID, ppv).ok()
                 }
             }
-
-            iid => boilerplate!(
-                iid,
-                ppv,
-                self,
-                [
-                    IAudioSessionControl,
-                    IAudioCaptureClient,
-                    IAudioClientDuckingControl,
-                    IAudioClock,
-                    IChannelAudioVolume,
-                    ISimpleAudioVolume,
-                    IAudioStreamVolume
-                ]
-            ),
+            _ => unsafe {
+                (self.inner.cast::<IAudioClient>()?.vtable().GetService)(
+                    self.inner.as_raw(),
+                    riid,
+                    ppv,
+                )
+            }
+            .ok(),
         }
     }
 }
@@ -1515,20 +1473,14 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                     },
                 }
             }
-            _ => boilerplate!(
-                iid,
-                ppv,
-                self,
-                [
-                    IAudioSessionControl,
-                    IAudioCaptureClient,
-                    IAudioClientDuckingControl,
-                    IAudioClock,
-                    IChannelAudioVolume,
-                    ISimpleAudioVolume,
-                    IAudioStreamVolume
-                ]
-            ),
+            _ => unsafe {
+                (self.inner.cast::<IAudioClient>()?.vtable().GetService)(
+                    self.inner.as_raw(),
+                    riid,
+                    ppv,
+                )
+            }
+            .ok(),
         }
     }
 }
@@ -1776,61 +1728,13 @@ extern "C" fn proxy_dummy() {}
 unsafe extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c_void) -> BOOL {
     match reason {
         DLL_PROCESS_ATTACH => {
+            std::panic::set_hook(Box::new(|panic_info| {
+                error!("{panic_info}");
+            }));
             unsafe {
                 HOOK_CO_CREATE_INSTANCE.enable().unwrap();
                 HOOK_CO_CREATE_INSTANCE_EX.enable().unwrap();
             };
-            spawn(|| {
-                // let _logger = Logger::try_with_env_or_str("info")
-                //     .unwrap()
-                //     .log_to_stdout()
-                //     .start();
-                std::panic::set_hook(Box::new(|panic_info| {
-                    error!("{panic_info}");
-                }));
-                let logger = Logger::with(<ConfigLogLevel as Into<LevelFilter>>::into(
-                    CONFIG.log_level,
-                ))
-                .format(formatter)
-                .write_mode(WriteMode::Async);
-                let handle = if !CONFIG.only_log_stdout {
-                    logger
-                        .log_to_file({
-                            let spec = FileSpec::default()
-                                .basename("wasapi_relink")
-                                .suppress_timestamp();
-                            if let Some(path) = &CONFIG.log_path
-                                && path.is_dir()
-                            {
-                                spec.directory(path)
-                            } else {
-                                spec
-                            }
-                        })
-                        .duplicate_to_stdout(Duplicate::All)
-                } else {
-                    logger.log_to_stdout()
-                }
-                .start()
-                .expect("unable to setup logger");
-                LOGGER_HANDLE.set(handle).ok();
-                info!(
-                    "Attempting to load config from working directory: {}",
-                    std::env::current_dir().map_or_else(
-                        |e| format!("unknown, err: {e}"),
-                        |path| path.display().to_string()
-                    )
-                );
-                match CONFIG.source {
-                    ConfigSource::Success => info!("Config loaded!"),
-                    ConfigSource::NoParse => {
-                        warn!("Unable to parse config, using default values")
-                    }
-                    ConfigSource::NoFile => {
-                        info!("Config file not found, using default values")
-                    }
-                }
-            });
         }
         DLL_PROCESS_DETACH => unsafe {
             HOOK_CO_CREATE_INSTANCE.disable().unwrap();
