@@ -185,23 +185,23 @@ impl AudioAlign<u32> {
 }
 
 macro_rules! trace_tagged {
-    (@$self:ident, $($arg:tt)+) => { trace_tagged!(&$self.info.tag, $($arg)+) };
+    (@$self:ident, $($arg:tt)+) => { trace_tagged!($self.info.tag, $($arg)+) };
     ($tag:expr, $($arg:tt)+) => { trace!(target: $tag.as_ref(), $($arg)+) };
 }
 macro_rules! debug_tagged {
-    (@$self:ident, $($arg:tt)+) => { debug_tagged!(&$self.info.tag, $($arg)+) };
+    (@$self:ident, $($arg:tt)+) => { debug_tagged!($self.info.tag, $($arg)+) };
     ($tag:expr, $($arg:tt)+) => { debug!(target: $tag.as_ref(), $($arg)+) };
 }
 macro_rules! info_tagged {
-    (@$self:ident, $($arg:tt)+) => { info_tagged!(&$self.info.tag, $($arg)+) };
+    (@$self:ident, $($arg:tt)+) => { info_tagged!($self.info.tag, $($arg)+) };
     ($tag:expr, $($arg:tt)+) => { info!(target: $tag.as_ref(), $($arg)+) };
 }
 macro_rules! warn_tagged {
-    (@$self:ident, $($arg:tt)+) => { warn_tagged!(&$self.info.tag, $($arg)+) };
+    (@$self:ident, $($arg:tt)+) => { warn_tagged!($self.info.tag, $($arg)+) };
     ($tag:expr, $($arg:tt)+) => { warn!(target: $tag.as_ref(), $($arg)+) };
 }
 macro_rules! error_tagged {
-    (@$self:ident, $($arg:tt)+) => { error_tagged!(&$self.info.tag, $($arg)+) };
+    (@$self:ident, $($arg:tt)+) => { error_tagged!($self.info.tag, $($arg)+) };
     ($tag:expr, $($arg:tt)+) => { error!(target: $tag.as_ref(), $($arg)+) };
 }
 
