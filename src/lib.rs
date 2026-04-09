@@ -398,7 +398,10 @@ impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
         dataflow: EDataFlow,
         dwstatemask: DEVICE_STATE,
     ) -> windows::core::Result<IMMDeviceCollection> {
-        debug!("DeviceEnumerator::EnumAudioEndpoints -> wrapping, flow: {dataflow:?}");
+        debug!(
+            "DeviceEnumerator::EnumAudioEndpoints requested on flow {}",
+            dataflow.0
+        );
         Ok(RedirectDeviceCollection {
             inner: unsafe { self.inner.EnumAudioEndpoints(dataflow, dwstatemask)? },
         }
@@ -410,7 +413,10 @@ impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
         dataflow: EDataFlow,
         role: ERole,
     ) -> windows::core::Result<IMMDevice> {
-        debug!("DeviceEnumerator::GetDefaultAudioEndpoint -> wrapping, flow: {dataflow:?}");
+        debug!(
+            "DeviceEnumerator::GetDefaultAudioEndpoint requested on flow {}",
+            dataflow.0
+        );
         Ok(
             RedirectDevice::new(unsafe { self.inner.GetDefaultAudioEndpoint(dataflow, role)? })
                 .into(),
@@ -418,7 +424,7 @@ impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
     }
 
     fn GetDevice(&self, pwstrid: &PCWSTR) -> windows::core::Result<IMMDevice> {
-        info!("DeviceEnumerator::GetDevice -> wrapping");
+        info!("DeviceEnumerator::GetDevice called, wrapping");
         Ok(RedirectDevice::new(unsafe { self.inner.GetDevice(*pwstrid)? }).into())
     }
 
