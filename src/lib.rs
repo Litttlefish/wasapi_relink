@@ -1073,31 +1073,25 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
         let iid = unsafe { *riid };
         debug_tagged!(@self, "GetService called, iid: {iid:?}");
         match iid {
-            IAudioRenderClient::IID => {
-                debug_tagged!(@self, "Returned RedirectCompatAudioRenderClient");
-                unsafe {
-                    let hooker_buffer_len = self.hooker.GetBufferSize().unwrap_or_else(|_| {
-                        self.get_info().current_buffer_len + self.get_info().fundamental
-                    });
-                    let inner_buffer_len = self.inner.GetBufferSize()?;
-                    let service: IAudioRenderClient = RedirectCompatAudioRenderClient {
-                        inner: self.inner.GetService::<IAudioRenderClient>()?,
-                        trick_buffer: vec![
-                            0;
-                            inner_buffer_len as usize * self.align.get() as usize
-                        ]
+            IAudioRenderClient::IID if self.align.get() != 0 => unsafe {
+                let hooker_buffer_len = self.hooker.GetBufferSize().unwrap_or_else(|_| {
+                    self.get_info().current_buffer_len + self.get_info().fundamental
+                });
+                let inner_buffer_len = self.inner.GetBufferSize()?;
+                let service: IAudioRenderClient = RedirectCompatAudioRenderClient {
+                    inner: self.inner.GetService::<IAudioRenderClient>()?,
+                    trick_buffer: vec![0; inner_buffer_len as usize * self.align.get() as usize]
                         .into_boxed_slice()
                         .into(),
-                        trick: self.trick.clone(),
-                        align: AudioAlign::new(self.align.get()),
-                        buffer_len: (inner_buffer_len, hooker_buffer_len),
-                        tag: self.info.tag.clone(),
-                    }
-                    .into();
-
-                    service.query(&IAudioRenderClient::IID, ppv).ok()
+                    trick: self.trick.clone(),
+                    align: AudioAlign::new(self.align.get()),
+                    buffer_len: (inner_buffer_len, hooker_buffer_len),
+                    tag: self.info.tag.clone(),
                 }
-            }
+                .into();
+
+                service.query(&IAudioRenderClient::IID, ppv).ok()
+            },
             _ => unsafe {
                 (self.inner.cast::<IAudioClient>()?.vtable().GetService)(
                     self.inner.as_raw(),
@@ -1373,7 +1367,10 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
             IAudioRenderClient::IID => {
                 let build_info = unsafe { &mut *self.build_info.get() };
                 match build_info {
-                    BuildStatus::Building(None) => unreachable!("How did you do this?"),
+                    BuildStatus::Building(None) => unsafe {
+                        let client = self.inner.GetService::<IAudioRenderClient>()?;
+                        client.query(&IAudioRenderClient::IID, ppv).ok()
+                    },
                     BuildStatus::Building(info) => {
                         let info = info.take().unwrap();
 
