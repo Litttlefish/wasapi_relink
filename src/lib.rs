@@ -396,11 +396,6 @@ impl IMMDeviceCollection_Impl for RedirectDeviceCollection_Impl {
     }
 }
 
-#[inline]
-unsafe fn assign<I: Interface>(ptr: *mut *mut c_void, component: I) -> windows::core::Result<()> {
-    unsafe { component.query(&I::IID, ptr).ok() }
-}
-
 macro_rules! impl_boilerplate {
     (IAudioClient1) => {
         fn GetMixFormat(&self) -> windows::core::Result<*mut WAVEFORMATEX> {
@@ -556,7 +551,7 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
                     );
                     info_tagged!(tag, "Client created");
                     let info = RedirectClientInfo::new(config, tag.into());
-                    let proxy_unknown: IAudioClient3 = match config.mode {
+                    let proxy: IAudioClient3 = match config.mode {
                         ClientMode::Normal => RedirectAudioClient::new(inner, info).into(),
                         ClientMode::Compat => RedirectCompatAudioClient::new(
                             inner,
@@ -587,7 +582,7 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
                         },
                         ClientMode::Bypass => inner,
                     };
-                    assign(ppinterface, proxy_unknown)
+                    proxy.query(riid, ppinterface).ok()
                 }
                 _ => (self.inner.vtable().Activate)(
                     self.inner.as_raw(),
@@ -1086,7 +1081,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     trick: self.trick.clone(),
                     align: AudioAlign::new(self.align.get()),
                     buffer_len: (inner_buffer_len, hooker_buffer_len),
-                    tag: self.info.tag.clone(),
+                    tag: format!("{}-client", self.info.tag).into(),
                 }
                 .into();
 
@@ -1386,8 +1381,8 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
 
                         let align = self.align.get().as_usize();
 
-                        let tag: Arc<str> = self.info.tag.clone().into();
-                        let client_tag = tag.clone();
+                        let tag = format!("{}-thread", self.info.tag).into_boxed_str();
+                        let client_tag = format!("{}-render", self.info.tag).into();
 
                         let thread = spawn(move || {
                             let app_thread = app_thread;
@@ -1564,7 +1559,7 @@ fn callback(
     mut buffer: CachingCons<Arc<HeapRb<u8>>>,
     client: &IAudioClient3,
     align: AudioAlign<usize>,
-    tag: Arc<str>,
+    tag: Box<str>,
 ) {
     let real_len = unsafe { client.GetBufferSize().unwrap() } as usize;
     let inner = unsafe { client.GetService::<IAudioRenderClient>().unwrap() };
@@ -1620,19 +1615,19 @@ struct RedirectRingbufAudioRenderClient {
         Arc<AtomicBool>, /* stop flag */
     ),
     trick: Rc<Cell<bool>>,
-    tag: Arc<str>,
+    tag: Box<str>,
 }
 impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
     fn GetBuffer(&self, numframesrequested: u32) -> windows::core::Result<*mut u8> {
         if self.trick.get() {
             info_tagged!(
                 self.tag,
-                "Render::GetBuffer called, requested: {numframesrequested}"
+                "GetBuffer called, requested: {numframesrequested}"
             );
         } else {
             trace_tagged!(
                 self.tag,
-                "Render::GetBuffer called, requested: {numframesrequested}"
+                "GetBuffer called, requested: {numframesrequested}"
             );
         }
         Ok(unsafe { &mut *self.buffer.get() }.1.as_mut_ptr())
@@ -1648,7 +1643,7 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
         if self.trick.get() {
             info_tagged!(
                 self.tag,
-                "Render::ReleaseBuffer called, written: {numframeswritten}"
+                "ReleaseBuffer called, written: {numframeswritten}"
             );
             if dwflags == 2 {
                 info_tagged!(self.tag, "discarding silent data");
