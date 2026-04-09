@@ -380,6 +380,70 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
 }
 
 #[repr(transparent)]
+#[implement(IMMDeviceEnumerator)]
+struct RedirectDeviceEnumerator {
+    inner: IMMDeviceEnumerator,
+}
+impl RedirectDeviceEnumerator {
+    pub fn new(inner: IMMDeviceEnumerator) -> Self {
+        Self { inner }
+    }
+}
+impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
+    fn EnumAudioEndpoints(
+        &self,
+        dataflow: EDataFlow,
+        dwstatemask: DEVICE_STATE,
+    ) -> windows::core::Result<IMMDeviceCollection> {
+        debug!("DeviceEnumerator::EnumAudioEndpoints -> wrapping, flow: {dataflow:?}");
+        Ok(RedirectDeviceCollection {
+            inner: unsafe { self.inner.EnumAudioEndpoints(dataflow, dwstatemask)? },
+        }
+        .into())
+    }
+
+    fn GetDefaultAudioEndpoint(
+        &self,
+        dataflow: EDataFlow,
+        role: ERole,
+    ) -> windows::core::Result<IMMDevice> {
+        debug!("DeviceEnumerator::GetDefaultAudioEndpoint -> wrapping, flow: {dataflow:?}");
+        Ok(
+            RedirectDevice::new(unsafe { self.inner.GetDefaultAudioEndpoint(dataflow, role)? })
+                .into(),
+        )
+    }
+
+    fn GetDevice(&self, pwstrid: &PCWSTR) -> windows::core::Result<IMMDevice> {
+        info!("DeviceEnumerator::GetDevice -> wrapping");
+        Ok(RedirectDevice::new(unsafe { self.inner.GetDevice(*pwstrid)? }).into())
+    }
+
+    fn RegisterEndpointNotificationCallback(
+        &self,
+        pclient: Ref<IMMNotificationClient>,
+    ) -> windows::core::Result<()> {
+        trace!("DeviceEnumerator::RegisterEndpointNotificationCallback called");
+        unsafe {
+            self.inner
+                .RegisterEndpointNotificationCallback(pclient.as_ref())
+        }
+    }
+
+    fn UnregisterEndpointNotificationCallback(
+        &self,
+        pclient: Ref<IMMNotificationClient>,
+    ) -> windows::core::Result<()> {
+        trace!("DeviceEnumerator::UnregisterEndpointNotificationCallback called");
+
+        unsafe {
+            self.inner
+                .UnregisterEndpointNotificationCallback(pclient.as_ref())
+        }
+    }
+}
+
+#[repr(transparent)]
 #[implement(IMMDeviceCollection)]
 struct RedirectDeviceCollection {
     inner: IMMDeviceCollection,
@@ -615,70 +679,6 @@ impl IMMEndpoint_Impl for RedirectDevice_Impl {
     fn GetDataFlow(&self) -> windows::core::Result<EDataFlow> {
         trace!("Device::GetDataFlow called");
         unsafe { self.inner.cast::<IMMEndpoint>()?.GetDataFlow() }
-    }
-}
-
-#[repr(transparent)]
-#[implement(IMMDeviceEnumerator)]
-struct RedirectDeviceEnumerator {
-    inner: IMMDeviceEnumerator,
-}
-impl RedirectDeviceEnumerator {
-    pub fn new(inner: IMMDeviceEnumerator) -> Self {
-        Self { inner }
-    }
-}
-impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
-    fn EnumAudioEndpoints(
-        &self,
-        dataflow: EDataFlow,
-        dwstatemask: DEVICE_STATE,
-    ) -> windows::core::Result<IMMDeviceCollection> {
-        debug!("DeviceEnumerator::EnumAudioEndpoints -> wrapping, flow: {dataflow:?}");
-        Ok(RedirectDeviceCollection {
-            inner: unsafe { self.inner.EnumAudioEndpoints(dataflow, dwstatemask)? },
-        }
-        .into())
-    }
-
-    fn GetDefaultAudioEndpoint(
-        &self,
-        dataflow: EDataFlow,
-        role: ERole,
-    ) -> windows::core::Result<IMMDevice> {
-        debug!("DeviceEnumerator::GetDefaultAudioEndpoint -> wrapping, flow: {dataflow:?}");
-        Ok(
-            RedirectDevice::new(unsafe { self.inner.GetDefaultAudioEndpoint(dataflow, role)? })
-                .into(),
-        )
-    }
-
-    fn GetDevice(&self, pwstrid: &PCWSTR) -> windows::core::Result<IMMDevice> {
-        info!("DeviceEnumerator::GetDevice -> wrapping");
-        Ok(RedirectDevice::new(unsafe { self.inner.GetDevice(*pwstrid)? }).into())
-    }
-
-    fn RegisterEndpointNotificationCallback(
-        &self,
-        pclient: Ref<IMMNotificationClient>,
-    ) -> windows::core::Result<()> {
-        trace!("DeviceEnumerator::RegisterEndpointNotificationCallback called");
-        unsafe {
-            self.inner
-                .RegisterEndpointNotificationCallback(pclient.as_ref())
-        }
-    }
-
-    fn UnregisterEndpointNotificationCallback(
-        &self,
-        pclient: Ref<IMMNotificationClient>,
-    ) -> windows::core::Result<()> {
-        trace!("DeviceEnumerator::UnregisterEndpointNotificationCallback called");
-
-        unsafe {
-            self.inner
-                .UnregisterEndpointNotificationCallback(pclient.as_ref())
-        }
     }
 }
 
