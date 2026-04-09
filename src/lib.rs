@@ -19,6 +19,9 @@ use std::rc::Rc;
 use std::slice::from_raw_parts_mut;
 use std::sync::{Arc, LazyLock, Once, OnceLock, atomic::*};
 use std::thread::{JoinHandle, spawn};
+use windows::Win32::System::Threading::{
+    AVRT_PRIORITY_HIGH, AvSetMmThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+};
 
 use windows::{
     Win32::{
@@ -30,7 +33,7 @@ use windows::{
         System::Threading::{
             AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
             GetCurrentThread, GetThreadDescription, INFINITE, SetEvent, SetThreadPriority,
-            THREAD_PRIORITY_TIME_CRITICAL, WaitForSingleObject,
+            WaitForSingleObject,
         },
         UI::Shell::PropertiesSystem::IPropertyStore,
     },
@@ -277,7 +280,7 @@ const LIB_NAME: PCWSTR = w!("ole32.dll");
 const CO_CREATE: PCSTR = s!("CoCreateInstance");
 const CO_CREATE_EX: PCSTR = s!("CoCreateInstanceEx");
 
-const PRO_AUDIO: PCWSTR = w!("Pro Audio");
+const AUDIO_TASK: PCWSTR = w!("Audio");
 
 const KEYWORDS: &[&str] = &["[GAME]", "[SK]"];
 
@@ -435,7 +438,6 @@ impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
         pclient: Ref<IMMNotificationClient>,
     ) -> windows::core::Result<()> {
         trace!("DeviceEnumerator::UnregisterEndpointNotificationCallback called");
-
         unsafe {
             self.inner
                 .UnregisterEndpointNotificationCallback(pclient.as_ref())
@@ -455,7 +457,7 @@ impl IMMDeviceCollection_Impl for RedirectDeviceCollection_Impl {
     }
 
     fn Item(&self, ndevice: u32) -> windows::core::Result<IMMDevice> {
-        debug!("DeviceCollection::Item -> wrapping, device {ndevice}");
+        debug!("DeviceCollection::Item retrieved device {ndevice}");
         Ok(RedirectDevice::new(unsafe { self.inner.Item(ndevice)? }).into())
     }
 }
@@ -753,7 +755,7 @@ impl Shared3Info {
         };
         info_tagged!(
             info.tag,
-            "Current period = {current_buffer_len}, Min period = {pminperiodinframes}, Max period = {pmaxperiodinframes}, Samplerate = {samplerate}"
+            "Period: Current = {current_buffer_len}, Min = {pminperiodinframes}, Max = {pmaxperiodinframes}, Samplerate = {samplerate}"
         );
         Self {
             current_buffer_len,
@@ -868,8 +870,7 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
     }
 
     fn GetService(&self, riid: *const GUID, ppv: *mut *mut c_void) -> windows::core::Result<()> {
-        let iid = unsafe { *riid };
-        debug_tagged!(@self, "GetService called, iid: {iid:?}");
+        debug_tagged!(@self, "GetService called, iid: {:?}", unsafe { *riid });
         unsafe {
             (self.inner.cast::<IAudioClient>()?.vtable().GetService)(self.inner.as_raw(), riid, ppv)
         }
@@ -978,7 +979,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
         }
         info_tagged!(
             @self,
-            "Initialize -> redirecting, original dur = {hnsbufferduration} * 100ns"
+            "Initialize -> setting hooker, original dur = {hnsbufferduration} * 100ns"
         );
         if streamflags & AUDCLNT_STREAMFLAGS_LOOPBACK == 0 {
             let calculated_dur = self
@@ -1084,7 +1085,6 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     tag: format!("{}-client", self.info.tag).into(),
                 }
                 .into();
-
                 service.query(&IAudioRenderClient::IID, ppv).ok()
             },
             _ => unsafe {
@@ -1187,7 +1187,7 @@ impl IAudioRenderClient_Impl for RedirectCompatAudioRenderClient_Impl {
         if self.trick.get() {
             info_tagged!(
                 self.tag,
-                "Render::GetBuffer called, requested: {numframesrequested}, tricking"
+                "GetBuffer called, requested: {numframesrequested}"
             );
             Ok(unsafe { &mut *self.trick_buffer.get() }.as_mut_ptr())
         } else {
@@ -1199,7 +1199,7 @@ impl IAudioRenderClient_Impl for RedirectCompatAudioRenderClient_Impl {
         if self.trick.get() {
             info_tagged!(
                 self.tag,
-                "Render::ReleaseBuffer called, written: {numframeswritten}"
+                "ReleaseBuffer called, written: {numframeswritten}"
             );
             if dwflags == 2 {
                 if numframeswritten == self.buffer_len.0 {
@@ -1385,29 +1385,35 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                         let client_tag = format!("{}-render", self.info.tag).into();
 
                         let thread = spawn(move || {
-                            let app_thread = app_thread;
-                            let mut task_index = 0u32;
                             let client_ptr = with_exposed_provenance_mut::<c_void>(raw);
                             let client_ref = unsafe {
                                 IAudioClient3::from_raw_borrowed(&client_ptr).unwrap_unchecked()
                             };
+                            let mut task_index = 0;
                             let mmcss_handle = unsafe {
-                                info_tagged!(tag, "Registering MMCSS Pro Audio thread");
-                                AvSetMmThreadCharacteristicsW(PRO_AUDIO, &mut task_index)
+                                info_tagged!(tag, "Registering MMCSS Audio thread with priority");
+                                AvSetMmThreadCharacteristicsW(AUDIO_TASK, &mut task_index)
                             }
+                            .inspect(|&handle| unsafe {
+                                AvSetMmThreadPriority(handle, AVRT_PRIORITY_HIGH).unwrap_or_else(
+                                    |e| {
+                                        error_tagged!(tag, "Failed to set avrt priority: {e}");
+                                    },
+                                );
+                            })
                             .inspect_err(|e| {
                                 error_tagged!(
                                     tag,
-                                    "Failed to register MMCSS: {e}, falling back to TimeCritical"
+                                    "Failed to register MMCSS: {e}, falling back to above normal"
                                 );
                                 unsafe {
                                     SetThreadPriority(
                                         GetCurrentThread(),
-                                        THREAD_PRIORITY_TIME_CRITICAL,
+                                        THREAD_PRIORITY_ABOVE_NORMAL,
                                     )
                                 }
                                 .unwrap_or_else(|e| {
-                                    error_tagged!(tag, "Failed to set Critical: {e}");
+                                    error_tagged!(tag, "Failed to set priority: {e}");
                                 });
                             })
                             .ok();
