@@ -1054,10 +1054,11 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
     fn Reset(&self) -> windows::core::Result<()> {
         info_tagged!(@self, "Reset called");
         unsafe {
-            self.trick.set(true);
             _ = self.hooker.Reset();
-            self.inner.Reset()
+            self.inner.Reset()?;
         }
+        self.trick.set(true);
+        Ok(())
     }
 
     fn SetEventHandle(&self, eventhandle: HANDLE) -> windows::core::Result<()> {
@@ -1332,11 +1333,12 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
 
     fn Reset(&self) -> windows::core::Result<()> {
         info_tagged!(@self, "Reset called");
-        self.trick.set(true);
+        unsafe { self.inner.Reset()? }
         if let Some(buf) = self.buffer.get() {
             unsafe { &mut *(Arc::as_ptr(buf).cast_mut()) }.clear();
         }
-        unsafe { self.inner.Reset() }
+        self.trick.set(true);
+        Ok(())
     }
 
     fn SetEventHandle(&self, eventhandle: HANDLE) -> windows::core::Result<()> {
