@@ -1333,6 +1333,9 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
     fn Reset(&self) -> windows::core::Result<()> {
         info_tagged!(@self, "Reset called");
         self.trick.set(true);
+        if let Some(buf) = self.buffer.get() {
+            unsafe { &mut *(Arc::as_ptr(buf).cast_mut()) }.clear();
+        }
         unsafe { self.inner.Reset() }
     }
 
