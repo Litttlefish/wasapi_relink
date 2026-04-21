@@ -10,17 +10,18 @@ use ringbuf::*;
 use serde::*;
 use std::cell::{Cell, OnceCell, UnsafeCell};
 use std::collections::HashMap;
-use std::hint::{spin_loop, unreachable_unchecked};
+use std::hint::unreachable_unchecked;
 use std::mem::transmute;
 use std::os::raw::c_void;
 use std::path::PathBuf;
-use std::ptr::with_exposed_provenance_mut;
 use std::rc::Rc;
 use std::slice::from_raw_parts_mut;
 use std::sync::{Arc, LazyLock, Once, OnceLock, atomic::*};
-use std::thread::{JoinHandle, spawn};
+use std::thread::spawn;
 use windows::Win32::System::Threading::{
-    AVRT_PRIORITY_HIGH, AvSetMmThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+    AVRT_PRIORITY_HIGH, IRtwqAsyncCallback, IRtwqAsyncCallback_Impl, IRtwqAsyncResult,
+    RtwqCreateAsyncResult, RtwqLockSharedWorkQueue, RtwqPutWaitingWorkItem, RtwqShutdown,
+    RtwqStartup, RtwqUnlockWorkQueue,
 };
 
 use windows::{
@@ -30,11 +31,7 @@ use windows::{
         System::Com::{StructuredStorage::*, *},
         System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
         System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH},
-        System::Threading::{
-            AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
-            GetCurrentThread, GetThreadDescription, INFINITE, SetEvent, SetThreadPriority,
-            WaitForSingleObject,
-        },
+        System::Threading::{CreateEventW, GetCurrentThread, GetThreadDescription, SetEvent},
         UI::Shell::PropertiesSystem::IPropertyStore,
     },
     core::*,
@@ -879,8 +876,8 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
         debug_tagged!(@self, "GetService called, iid: {:?}", unsafe { *riid });
         unsafe {
             (self.inner.cast::<IAudioClient>()?.vtable().GetService)(self.inner.as_raw(), riid, ppv)
+                .ok()
         }
-        .ok()
     }
 }
 
@@ -1099,8 +1096,8 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     riid,
                     ppv,
                 )
-            }
-            .ok(),
+                .ok()
+            },
         }
     }
 }
@@ -1182,7 +1179,7 @@ impl RedirectCompatAudioRenderClient {
         let read_len = self.align.frames_to_bytes(len) as usize;
         unsafe {
             let slice_to_write = from_raw_parts_mut(self.inner.GetBuffer(len)?, read_len);
-            let slice = &(&(*self.trick_buffer.get()))[..read_len];
+            let slice = &(&*self.trick_buffer.get())[..read_len];
             slice_to_write.copy_from_slice(slice);
             self.inner.ReleaseBuffer(len, dwflags)
         }
@@ -1234,25 +1231,13 @@ impl IAudioRenderClient_Impl for RedirectCompatAudioRenderClient_Impl {
     }
 }
 
-struct RenderClientBuildInfo {
-    producer: CachingProd<Arc<HeapRb<u8>>>,
-    consumer: CachingCons<Arc<HeapRb<u8>>>,
-    buffer_length: usize,
-    thread_handle: HANDLE,
-}
-
-enum BuildStatus {
-    Building(Option<RenderClientBuildInfo>),
-    Done(IAudioRenderClient),
-}
-
 #[implement(IAudioClient3)]
 struct RedirectRingbufAudioClient {
     inner: IAudioClient3,
     info: RedirectClientInfo,
     buffer: OnceCell<Arc<HeapRb<u8>>>,
     align: Cell<AudioAlign<u32>>,
-    build_info: UnsafeCell<BuildStatus>,
+    outer: OnceCell<IAudioRenderClient>,
     trick: Rc<Cell<bool>>,
     app_handle: Arc<AtomicPtr<c_void>>,
 }
@@ -1264,7 +1249,7 @@ impl RedirectRingbufAudioClient {
             info,
             buffer: OnceCell::new(),
             align: AudioAlign::Normal(0).into(),
-            build_info: BuildStatus::Building(None).into(),
+            outer: OnceCell::new(),
             trick: Cell::new(true).into(),
             app_handle: AtomicPtr::default().into(),
         }
@@ -1366,98 +1351,55 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
         debug_tagged!(@self, "GetService called, iid: {iid:?}");
         match iid {
             IAudioRenderClient::IID => {
-                let build_info = unsafe { &mut *self.build_info.get() };
-                match build_info {
-                    BuildStatus::Building(None) => unsafe {
-                        let client = self.inner.GetService::<IAudioRenderClient>()?;
-                        client.query(&IAudioRenderClient::IID, ppv).ok()
-                    },
-                    BuildStatus::Building(info) => {
-                        let info = info.take().unwrap();
-
-                        let stop_flag: Arc<AtomicBool> = AtomicBool::default().into();
-
-                        let raw = self.inner.as_raw().expose_provenance();
-
-                        let app_thread = self.app_handle.clone();
-
-                        let h = info.thread_handle.0.expose_provenance();
-
-                        let thread_stop_flag = stop_flag.clone();
-
-                        let align = self.align.get().as_usize();
-
-                        let tag = format!("{}-thread", self.info.tag).into_boxed_str();
-                        let client_tag = format!("{}-render", self.info.tag).into();
-
-                        let thread = spawn(move || {
-                            let client_ptr = with_exposed_provenance_mut::<c_void>(raw);
-                            let client_ref = unsafe {
-                                IAudioClient3::from_raw_borrowed(&client_ptr).unwrap_unchecked()
-                            };
-                            let mut task_index = 0;
-                            let mmcss_handle = unsafe {
-                                info_tagged!(tag, "Registering MMCSS Audio thread with priority");
-                                AvSetMmThreadCharacteristicsW(AUDIO_TASK, &mut task_index)
-                            }
-                            .inspect(|&handle| unsafe {
-                                AvSetMmThreadPriority(handle, AVRT_PRIORITY_HIGH).unwrap_or_else(
-                                    |e| {
-                                        error_tagged!(tag, "Failed to set avrt priority: {e}");
-                                    },
-                                );
-                            })
-                            .inspect_err(|e| {
-                                error_tagged!(
-                                    tag,
-                                    "Failed to register MMCSS: {e}, falling back to above normal"
-                                );
-                                unsafe {
-                                    SetThreadPriority(
-                                        GetCurrentThread(),
-                                        THREAD_PRIORITY_ABOVE_NORMAL,
-                                    )
-                                }
-                                .unwrap_or_else(|e| {
-                                    error_tagged!(tag, "Failed to set priority: {e}");
-                                });
-                            })
-                            .ok();
-                            callback(
-                                (
-                                    HANDLE(with_exposed_provenance_mut::<c_void>(h)),
-                                    thread_stop_flag,
-                                    app_thread,
-                                ),
-                                info.consumer,
-                                client_ref,
-                                align,
-                                tag,
-                            );
-                            if let Some(handle) = mmcss_handle {
-                                unsafe { AvRevertMmThreadCharacteristics(handle) }.ok();
-                            }
-                        });
-                        let client: IAudioRenderClient = RedirectRingbufAudioRenderClient {
-                            buffer: (
-                                info.producer,
-                                vec![0u8; align.frames_to_bytes(info.buffer_length)]
-                                    .into_boxed_slice(),
-                            )
-                                .into(),
-                            align,
-                            thread: (info.thread_handle, Some(thread), stop_flag),
-                            trick: self.trick.clone(),
-                            tag: client_tag,
-                        }
-                        .into();
-                        let ret = unsafe { client.query(&IAudioRenderClient::IID, ppv) }.ok();
-                        *build_info = BuildStatus::Done(client);
-                        ret
+                if let Some(client) = self.outer.get() {
+                    unsafe { client.query(&IAudioRenderClient::IID, ppv).ok() }
+                } else {
+                    let align = self.align.get().as_usize();
+                    let thread_tag = format!("{}-thread", self.info.tag).into_boxed_str();
+                    let client_tag = format!("{}-render", self.info.tag).into();
+                    let buffer = unsafe { self.buffer.get().unwrap_unchecked() };
+                    let event_handle = unsafe { CreateEventW(None, false, false, None)? };
+                    let stop_flag = Arc::new(AtomicBool::default());
+                    unsafe { self.inner.SetEventHandle(event_handle)? }
+                    let (producer, consumer) = buffer.clone().split();
+                    unsafe { RtwqStartup()? };
+                    let (mut _task_id, mut thread_id) = (0, 0);
+                    unsafe {
+                        RtwqLockSharedWorkQueue(
+                            AUDIO_TASK,
+                            AVRT_PRIORITY_HIGH.0,
+                            &mut _task_id,
+                            &mut thread_id,
+                        )?
+                    };
+                    info_tagged!(@self,"Creating thread");
+                    let callback = RedirectRingbufThread {
+                        stop_flag: stop_flag.clone(),
+                        thread_id,
+                        client: self.inner.clone(),
+                        app_handle: self.app_handle.clone(),
+                        event_handle,
+                        buffer: consumer.into(),
+                        real_len: unsafe { self.inner.GetBufferSize()? },
+                        inner: unsafe { self.inner.GetService::<IAudioRenderClient>()? },
+                        align,
+                        tag: thread_tag,
+                    };
+                    let callback: IRtwqAsyncCallback = callback.into();
+                    let result = unsafe { RtwqCreateAsyncResult(None, &callback, None)? };
+                    unsafe { RtwqPutWaitingWorkItem(event_handle, 1, &result, None)? }
+                    let client: IAudioRenderClient = RedirectRingbufAudioRenderClient {
+                        buffer: producer.into(),
+                        cache: vec![0u8; buffer.capacity().get()].into_boxed_slice().into(),
+                        align,
+                        trick: self.trick.clone(),
+                        tag: client_tag,
+                        thread: (event_handle, stop_flag),
                     }
-                    BuildStatus::Done(client) => unsafe {
-                        client.query(&IAudioRenderClient::IID, ppv).ok()
-                    },
+                    .into();
+                    let ret = unsafe { client.query(&IAudioRenderClient::IID, ppv) }.ok();
+                    _ = self.outer.set(client);
+                    ret
                 }
             }
             _ => unsafe {
@@ -1466,8 +1408,8 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                     riid,
                     ppv,
                 )
-            }
-            .ok(),
+                .ok()
+            },
         }
     }
 }
@@ -1522,7 +1464,6 @@ impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
                 self.inner.SetClientProperties(&properties)?;
             }
             let align = (*pformat).nBlockAlign;
-            let callback_handle = CreateEventW(None, false, false, PCWSTR::null())?;
             let buf_len = if let Some(buf) = target_config
                 .ring_buffer_len
                 .get(&self.get_info().samplerate)
@@ -1536,18 +1477,8 @@ impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
                 self.get_info().current_buffer_len * 10
             };
             let buffer = Arc::new(HeapRb::new(buf_len as usize * align as usize));
-            let (producer, consumer) = buffer.clone().split();
-
-            _ = self.buffer.set(buffer);
+            _ = self.buffer.set(buffer.clone());
             self.align.set(AudioAlign::new(align as u32));
-            let build_info = &mut *self.build_info.get();
-            *build_info = BuildStatus::Building(Some(RenderClientBuildInfo {
-                producer,
-                consumer,
-                buffer_length: buf_len as usize,
-                thread_handle: callback_handle,
-            }));
-
             if streamflags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK == 0 {
                 info_tagged!(@self, "Injecting event flag");
                 streamflags |= AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
@@ -1559,75 +1490,102 @@ impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
                 self.get_info().current_buffer_len,
                 pformat,
                 Some(audiosessionguid),
-            )?;
-            self.inner.SetEventHandle(callback_handle)
+            )
         }
     }
 }
 drop_boilerplate!(RedirectRingbufAudioClient);
 
-fn callback(
-    thread_info: (HANDLE, Arc<AtomicBool>, Arc<AtomicPtr<c_void>>),
-    mut buffer: CachingCons<Arc<HeapRb<u8>>>,
-    client: &IAudioClient3,
+#[implement(IRtwqAsyncCallback)]
+struct RedirectRingbufThread {
+    stop_flag: Arc<AtomicBool>,
+    thread_id: u32,
+    event_handle: HANDLE,
+    app_handle: Arc<AtomicPtr<c_void>>,
+    buffer: UnsafeCell<CachingCons<Arc<HeapRb<u8>>>>,
+    client: IAudioClient3,
     align: AudioAlign<usize>,
+    real_len: u32,
+    inner: IAudioRenderClient,
     tag: Box<str>,
-) {
-    let real_len = unsafe { client.GetBufferSize().unwrap() } as usize;
-    let inner = unsafe { client.GetService::<IAudioRenderClient>().unwrap() };
-    while buffer.is_empty() {
-        spin_loop();
+}
+impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
+    fn GetParameters(&self, pdwflags: *mut u32, pdwqueue: *mut u32) -> windows_core::Result<()> {
+        unsafe {
+            *pdwflags = 1; // MFASYNC_FAST_IO_PROCESSING_CALLBACK
+            *pdwqueue = self.thread_id
+        };
+        Ok(())
     }
-    while !thread_info.1.load(Ordering::Relaxed) {
+    fn Invoke(
+        &self,
+        pasyncresult: windows_core::Ref<IRtwqAsyncResult>,
+    ) -> windows_core::Result<()> {
+        if self.stop_flag.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let buffer = unsafe { &mut *self.buffer.get() };
         if buffer.is_empty() {
-            let pad = unsafe { client.GetCurrentPadding().unwrap() };
+            let pad = unsafe { self.client.GetCurrentPadding()? };
             if pad == 0 {
-                warn_tagged!(tag, "buffer is empty, underflow may happen!");
+                warn_tagged!(self.tag, "buffer is empty, underflow may happen!");
             } else {
-                debug_tagged!(tag, "mid-buffer empty, data in client buffer: {pad}");
+                debug_tagged!(self.tag, "mid-buffer empty, data in client buffer: {pad}");
             }
             unsafe {
-                if let Some(handle) = thread_info.2.load(Ordering::Relaxed).as_mut() {
+                if let Some(handle) = self.app_handle.load(Ordering::Relaxed).as_mut() {
                     SetEvent(HANDLE(handle)).ok();
                 }
-                WaitForSingleObject(thread_info.0, INFINITE);
+                RtwqPutWaitingWorkItem(self.event_handle, 1, pasyncresult.as_ref(), None)?;
             }
-            continue;
+            return Ok(());
         }
-        let read_len = align.bytes_to_frames(buffer.occupied_len());
+        let read_len = self.align.bytes_to_frames(buffer.occupied_len());
         let write_len =
-            read_len.min(real_len - unsafe { client.GetCurrentPadding().unwrap() } as usize);
-        let slice: &mut [u8] = unsafe {
+            read_len.min((self.real_len - unsafe { self.client.GetCurrentPadding()? }) as usize);
+        let slice = unsafe {
             from_raw_parts_mut(
-                inner.GetBuffer(write_len as u32).unwrap(),
-                align.frames_to_bytes(write_len),
+                self.inner.GetBuffer(write_len as u32)?,
+                self.align.frames_to_bytes(write_len),
             )
         };
         buffer.pop_slice(slice);
         unsafe {
-            inner.ReleaseBuffer(write_len as u32, 0).unwrap();
-            trace_tagged!(tag, "data in mid-buffer: {read_len}, written: {write_len}");
-            if let Some(handle) = thread_info.2.load(Ordering::Relaxed).as_mut() {
+            self.inner.ReleaseBuffer(write_len as u32, 0)?;
+            trace_tagged!(
+                self.tag,
+                "data in mid-buffer: {read_len}, written: {write_len}"
+            );
+            if let Some(handle) = self.app_handle.load(Ordering::Relaxed).as_mut() {
                 SetEvent(HANDLE(handle)).ok();
             }
-            WaitForSingleObject(thread_info.0, INFINITE);
+            RtwqPutWaitingWorkItem(self.event_handle, 1, pasyncresult.as_ref(), None)?;
         };
+        Ok(())
+    }
+}
+impl Drop for RedirectRingbufThread {
+    fn drop(&mut self) {
+        unsafe {
+            RtwqUnlockWorkQueue(self.thread_id)
+                .and_then(|_| RtwqShutdown())
+                .unwrap_or_else(|e| {
+                    error_tagged!(self.tag, "Encountered error when closing thread: {e}")
+                });
+            self.event_handle.free();
+        }
+        info_tagged!(self.tag, "Consumer thread stopped");
     }
 }
 
-type RbRenderBuffer = (CachingProd<Arc<HeapRb<u8>>>, Box<[u8]>);
-
 #[implement(IAudioRenderClient)]
 struct RedirectRingbufAudioRenderClient {
-    buffer: UnsafeCell<RbRenderBuffer>,
+    buffer: UnsafeCell<CachingProd<Arc<HeapRb<u8>>>>,
+    cache: UnsafeCell<Box<[u8]>>,
     align: AudioAlign<usize>,
-    thread: (
-        HANDLE,
-        Option<JoinHandle<()>>,
-        Arc<AtomicBool>, /* stop flag */
-    ),
     trick: Rc<Cell<bool>>,
     tag: Box<str>,
+    thread: (HANDLE, Arc<AtomicBool>),
 }
 impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
     fn GetBuffer(&self, numframesrequested: u32) -> windows::core::Result<*mut u8> {
@@ -1642,7 +1600,7 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
                 "GetBuffer called, requested: {numframesrequested}"
             );
         }
-        Ok(unsafe { &mut *self.buffer.get() }.1.as_mut_ptr())
+        Ok(unsafe { &mut *self.cache.get() }.as_mut_ptr())
     }
     fn ReleaseBuffer(&self, numframeswritten: u32, dwflags: u32) -> windows::core::Result<()> {
         if numframeswritten == 0 {
@@ -1662,39 +1620,30 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
                 return Ok(());
             }
         }
-        let (buffer, temp_buffer) = unsafe { &mut *self.buffer.get() };
-        let slice = &mut temp_buffer[..(self.align.frames_to_bytes(numframeswritten as usize))];
-        if dwflags == 2 {
-            slice.fill(0);
-        }
-        let written_len = buffer.push_slice(slice);
-        debug_tagged!(
-            self.tag,
-            "ReleaseBuffer called, written: {}",
-            self.align.bytes_to_frames(written_len)
-        );
+        unsafe {
+            let buffer = &mut *self.buffer.get();
+            let slice = &mut (&mut *self.cache.get())
+                [..(self.align.frames_to_bytes(numframeswritten as usize))];
+            if dwflags == 2 {
+                slice.fill(0);
+            }
+            let written_len = buffer.push_slice(slice);
+            debug_tagged!(
+                self.tag,
+                "ReleaseBuffer called, written: {}",
+                self.align.bytes_to_frames(written_len)
+            )
+        };
         Ok(())
     }
 }
-
 impl Drop for RedirectRingbufAudioRenderClient {
     fn drop(&mut self) {
-        self.thread.2.store(true, Ordering::Relaxed);
+        info_tagged!(self.tag, "Stopping consumer thread");
+        self.thread.1.store(true, Ordering::Relaxed);
         unsafe {
             SetEvent(self.thread.0).ok();
         }
-        if let Some(thread) = self.thread.1.take() {
-            let join_result = thread.join();
-            match join_result {
-                Ok(()) => {
-                    info_tagged!(self.tag, "Consumer thread stopped");
-                }
-                Err(e) => {
-                    error_tagged!(self.tag, "Consumer thread panicked on shutdown: {:?}", e);
-                }
-            }
-        }
-        unsafe { self.thread.0.free() };
     }
 }
 

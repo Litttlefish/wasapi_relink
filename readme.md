@@ -79,7 +79,7 @@ P.S.: Currently, there don't seem to be many sound cards that are compatible wit
 
 3. Injection and inverse modes
 
-- If the application doesn't use event-driven flag, `wasapi_relink` injects `AUDCLNT_STREAMFLAGS_EVENTCALLBACK` and runs its own consumer thread that waits on real engine event, move the data from the ring buffer to `IAudioRenderClient` on the real client.
+- If the application doesn't use event-driven flag, `wasapi_relink` injects `AUDCLNT_STREAMFLAGS_EVENTCALLBACK` and runs its own consumer thread, which is based on Real-Time Work Queue API, that waits on real engine event and move the data from the ring buffer to `IAudioRenderClient` on the real client.
 - If the application requested event-driven flag, `wasapi_relink` takes over the app’s event handle and decides when to call `SetEvent` to wake the app’s callback. Internally it still uses its own thread to consume from the ring buffer. In effect, the chain becomes:
 
 ```text
