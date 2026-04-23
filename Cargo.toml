@@ -22,8 +22,9 @@ windows-core = "0.62.*"
 flexi_logger = { version = "0.31.*", features = ["async"] }
 serde = { version = "1.*", features = ["derive"] }
 toml = "1.*"
-ringbuf = "0.*"
+# ringbuf = "0.*"
 num-traits = "0.2.*"
+rtrb = "0.3.*"
 # mimalloc = { version = "*", features = ["v3"] }
 # uuid = { version = "1.20.0", features = ["v4"] }
 # min_hook_rs = "2.*"

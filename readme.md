@@ -12,7 +12,7 @@ Many applications and games use WASAPI's Shared mode for audio playback. While i
 
 ### Reminder: Your Driver is Everything
 
-This tool is 100% dependent on your audio driver. The `target_buffer_dur_ms` setting in config is a ***request***, not a *command*.
+This tool is 100% dependent on your audio driver. The `target_period_hus` setting in config is a ***request***, not a *command*.
 
 Your audio driver reports a supported buffer range (i.e. `GetSharedModeEnginePeriod`), and `wasapi_relink` will clamp the request to fit within that range, this problem is most obvious when using Realtek onboard soundcards, see below.
 
@@ -45,6 +45,8 @@ P.S.: Currently, there don't seem to be many sound cards that are compatible wit
 2. Ignores the application's buffer request and instead calls `IAudioClient3::InitializeSharedAudioStream` to initialize a low-latency stream.
 
 3. This provides the application with a much smaller buffer (e.g., 2ms), dramatically reducing latency.
+
+4. You can specify a smaller reported buffer length to further reduce latency.
 
 ### Compat Mode (For compatibility with legacy/poorly coded apps)
 
@@ -79,7 +81,7 @@ P.S.: Currently, there don't seem to be many sound cards that are compatible wit
 
 3. Injection and inverse modes
 
-- If the application doesn't use event-driven flag, `wasapi_relink` injects `AUDCLNT_STREAMFLAGS_EVENTCALLBACK` and runs its own consumer thread, which is based on Real-Time Work Queue API, that waits on real engine event and move the data from the ring buffer to `IAudioRenderClient` on the real client.
+- If the application doesn't use event-driven flag, `wasapi_relink` injects `AUDCLNT_STREAMFLAGS_EVENTCALLBACK` and runs its own consumer thread, which is based on Real-Time Work Queue API, that waits on real engine event and move the data from the ring buffer to `IAudioRenderClient` on the real client, operating according to the configured reported buffer length.
 - If the application requested event-driven flag, `wasapi_relink` takes over the app’s event handle and decides when to call `SetEvent` to wake the app’s callback. Internally it still uses its own thread to consume from the ring buffer. In effect, the chain becomes:
 
 ```text
@@ -133,10 +135,13 @@ log_level = "Info"
 only_log_stdout = false
 
 [capture]
-# (General) Target buffer duration in 0.1ms units (u16).
-# The tool will calculate the closest buffer size *not exceeding* this duration while clamped within driver range.
+# (General) Target device period in 0.1ms units (u16).
+# The tool will calculate the closest period *not exceeding* this duration while clamped within driver range.
 # e.g., 20 = 2.0ms.
-target_buffer_dur_ms = 20
+target_period_hus = 20
+# (General) Target buffer length (in audio frames) reported to the corresponding samplerate.
+# The number will be automatically rounded UP to align with the driver's fundamental period for optimal performance while clamped within range.
+target_buffer_len.48000 = 256
 # (General) Enable raw process for this stream (bool).
 raw = true
 
@@ -151,8 +156,8 @@ ring_buffer_len.48000 = 340 # about 7ms buffer
 
 # (Compat mode exclusive, Optional) Assign a shared stream buffer duration (in 100-nanosecond units) to the corresponding samplerate.
 # The number will be directly used as the inner shared buffer, and will be clamped by Windows if set too low.
-compat_buffer_len.48000 = 0 # this will clamp to minimum allowed value
-compat_buffer_len.96000 = 238350
+compat_buffer_dur_hns.48000 = 0 # this will clamp to minimum allowed value
+compat_buffer_dur_hns.96000 = 238350
 
 
 ```
@@ -173,14 +178,17 @@ compat_buffer_len.96000 = 238350
 
   - `mode` (string): `Normal`, `Compat`, `Ringbuf`, `Bypass`. Default is `Normal`.
 
-  - `target_buffer_dur_ms` (u16): The target buffer size for all created low latency shared stream in **units of 0.1 milliseconds**. The tool will default to the driver's minimum if this is set too low or not specified. **You should generally not change this from the default value unless you experience audio pops.**
+  - `target_period_hus` (u32): Target period for all created low latency shared stream in **units of 0.1 milliseconds**. The tool will default to the driver's minimum if this is set too low or not specified. **You should generally not change this from the default value unless you experience audio pops.**
+  
+  - `target_buffer_len.<samplerate>` (u32): Target reported buffer length for the size of low latency shared stream in **audio frames** (not samples). For example, 256 means 256 frames (512 samples in 2-channel audio). The tool will default to the full buffer if not specified.
+    - Note: Valid range is [`device_period`, `full_buffer_len`], other value will be clamped. Will automatically round this value *UP* to the nearest multiple of the driver’s fundamental period.
 
   - `raw` (bool): Indicates this stream to use **raw processing**, which bypasses most APO. Does nothing when mode is `Bypass`.
 
-  - `ring_buffer_len.<samplerate>` (u32): The target buffer length for the ring buffer in **audio frames** (not samples). For example, 340 means 340 frames (680 samples in 2-channel audio). **It's recommended to set a proper value in Ringbuf mode.**
-    - Note: The tool will automatically round this value *UP* to the nearest multiple of the driver’s fundamental period to ensure smooth streaming and prevent micro-glitches.
+  - `ring_buffer_len.<samplerate>` (u32): Target buffer length for the ring buffer in **audio frames**. **It's recommended to set a proper value in Ringbuf mode.**
+    - Note: The tool will automatically round this value *UP* to the nearest multiple of fundamental period to ensure smooth streaming and prevent micro-glitches.
 
-  - `compat_buffer_len.<samplerate>` (i64): The target buffer size for shared stream in **100-nanosecond units**. This controls the size of the shared buffer the program actually sees in Compat mode. The tool/Windows will default to the driver’s minimum if this is set too low or not specified. **This can help fix audio pops that occur after changing the audio sample rate in Compat mode.**
+  - `compat_buffer_dur_hns.<samplerate>` (i64): Target buffer size for shared stream in **units of 100 nanoseconds**. This controls the size of the shared buffer the program actually sees in Compat mode. The tool/Windows will default to the driver’s minimum if this is set too low or not specified. **This can help fix audio pops that occur after changing the audio sample rate in Compat mode.**
 
 ## Troubleshooting
 
@@ -210,7 +218,7 @@ Use this guide to diagnose and fix common audio issues.
 
 **Solutions (Try either one):**
 
-1. **Increase Buffer:** Slightly increase `target_buffer_dur_ms`. If your driver's minimum is 2ms (e.g., `20`), try `30` (3ms) or `40` (4ms) until the pops disappear.
+1. **Increase Buffer:** Slightly increase `target_period_hus`. If your driver's minimum is 2ms (e.g., `20`), try `30` (3ms) or `40` (4ms) until the pops disappear.
 
 2. **Try Compat or Ringbuf Mode:** This effectively adds a buffer layer for the application (i.e., the standard buffer from normal Shared mode). In combination with the changes made by those modes, this can potentially resolve the issue.
 
@@ -218,14 +226,14 @@ Use this guide to diagnose and fix common audio issues.
 
 **Phenomenon:** Audio playback is normal at samplerate A (e.g. 48000Hz), but pops at samplerate B (e.g. 96000 Hz) in compat mode.
 
-**Cause:** In Compat mode, `compat_buffer_len` is mapped specifically to the active samplerate. If you switch the system samplerate but haven’t configured a buffer length for the new one, it falls back to a default value that might be too low for that specific rate.
+**Cause:** In Compat mode, `compat_buffer_dur_hns` is mapped specifically to the active samplerate. If you switch the system samplerate but haven’t configured a buffer length for the new one, it falls back to a default value that might be too low for that specific rate.
 
 **Solution:** Explicitly add the new samplerate to your config. For example:
 
 ```toml
 [playback]
-compat_buffer_len.48000 = 238350
-compat_buffer_len.96000 = 250000  # Add a specific value for 96kHz
+compat_buffer_dur_hns.48000 = 238350
+compat_buffer_dur_hns.96000 = 250000  # Add a specific value for 96kHz
 ```
 
 ### Program won't start at all

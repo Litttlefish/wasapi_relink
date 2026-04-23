@@ -5,13 +5,13 @@ use flexi_logger::*;
 use log::*;
 use num_traits::PrimInt;
 use retour::GenericDetour;
-use ringbuf::traits::*;
-use ringbuf::*;
+use rtrb::{Consumer, Producer, RingBuffer};
 use serde::*;
 use std::cell::{Cell, OnceCell, UnsafeCell};
 use std::collections::HashMap;
 use std::hint::unreachable_unchecked;
 use std::mem::transmute;
+use std::num::NonZero;
 use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -159,11 +159,32 @@ impl RedirectConfig {
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct ClientConfig {
-    target_buffer_dur_ms: u32,
-    ring_buffer_len: HashMap<u32, u32>,
+    target_period_hus: u32,
+    ring_buffer_len: HashMap<u32, NonZero<u32>>,
+    target_buffer_len: HashMap<u32, NonZero<u32>>,
+    compat_buffer_dur_hns: HashMap<u32, i64>,
     mode: ClientMode,
-    compat_buffer_len: HashMap<u32, i64>,
     raw: bool,
+}
+impl ClientConfig {
+    fn target_buf_len(&self, info: &Shared3Info) -> Option<u32> {
+        self.target_buffer_len
+            .get(&info.samplerate)
+            .copied()
+            .map(|l| l.get().div_ceil(info.fundamental) * info.fundamental)
+    }
+    fn ring_buf_len(&self, info: &Shared3Info) -> Option<u32> {
+        self.ring_buffer_len
+            .get(&info.samplerate)
+            .copied()
+            .map(|l| {
+                info.current_period
+                    .max(l.get().div_ceil(info.fundamental) * info.fundamental)
+            })
+    }
+    fn compat_buf_len(&self, info: &Shared3Info) -> Option<i64> {
+        self.compat_buffer_dur_hns.get(&info.samplerate).copied()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -501,7 +522,7 @@ macro_rules! impl_boilerplate {
             if let Some(phnsdefaultdeviceperiod) = unsafe { phnsdefaultdeviceperiod.as_mut() } {
                 *phnsdefaultdeviceperiod = calculate_period(
                     self.get_info().samplerate,
-                    self.get_info().current_buffer_len,
+                    self.get_info().current_period,
                 )
                 .max(minimumdeviceperiod)
             }
@@ -723,7 +744,7 @@ const fn calculate_period(sample_rate: u32, buffer_len: u32) -> i64 {
 }
 
 struct Shared3Info {
-    current_buffer_len: u32,
+    current_period: u32,
     samplerate: u32,
     fundamental: u32,
 }
@@ -746,11 +767,11 @@ impl Shared3Info {
                 .unwrap()
         };
         let samplerate = unsafe { *pformat }.nSamplesPerSec;
-        let current_buffer_len = if info.config.target_buffer_dur_ms != 0 {
+        let current_period = if info.config.target_period_hus != 0 {
             calculate_buffer(
                 samplerate,
                 pfundamentalperiodinframes,
-                info.config.target_buffer_dur_ms,
+                info.config.target_period_hus,
             )
             .clamp(pminperiodinframes, pmaxperiodinframes)
         } else {
@@ -758,10 +779,10 @@ impl Shared3Info {
         };
         info_tagged!(
             info.tag,
-            "Period: Current = {current_buffer_len}, Min = {pminperiodinframes}, Max = {pmaxperiodinframes}, Samplerate = {samplerate}"
+            "Period: Current = {current_period}, Min = {pminperiodinframes}, Max = {pmaxperiodinframes}, Samplerate = {samplerate}"
         );
         Self {
-            current_buffer_len,
+            current_period,
             samplerate,
             fundamental: pfundamentalperiodinframes,
         }
@@ -838,18 +859,19 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
     }
 
     fn GetBufferSize(&self) -> windows::core::Result<u32> {
-        let buf = unsafe { self.inner.GetBufferSize()? };
+        let real_size = unsafe { self.inner.GetBufferSize()? };
+        let buf = if let Some(len) = self.info.config.target_buf_len(self.get_info()) {
+            len.clamp(self.get_info().current_period, real_size)
+        } else {
+            real_size
+        };
         info_tagged!(@self, "GetBufferSize called, buffer length: {buf}");
         Ok(buf)
     }
 
     fn GetCurrentPadding(&self) -> windows::core::Result<u32> {
         trace_tagged!(@self, "GetCurrentPadding called");
-        let pad = unsafe { self.inner.GetCurrentPadding()? };
-        if pad == 0 {
-            warn_tagged!(@self, "underflow may happen!");
-        }
-        Ok(pad)
+        unsafe { self.inner.GetCurrentPadding() }
     }
 
     fn Start(&self) -> windows::core::Result<()> {
@@ -930,7 +952,7 @@ impl IAudioClient3_Impl for RedirectAudioClient_Impl {
             }
             self.inner.InitializeSharedAudioStream(
                 streamflags,
-                self.get_info().current_buffer_len,
+                self.get_info().current_period,
                 pformat,
                 Some(audiosessionguid),
             )
@@ -988,9 +1010,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
             let calculated_dur = self
                 .info
                 .config
-                .compat_buffer_len
-                .get(&self.get_info().samplerate)
-                .copied()
+                .compat_buf_len(self.get_info())
                 .unwrap_or_default();
             info_tagged!(@self, "Inner dur = {calculated_dur} * 100ns");
             unsafe {
@@ -1027,11 +1047,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
 
     fn GetCurrentPadding(&self) -> windows::core::Result<u32> {
         trace_tagged!(@self, "GetCurrentPadding called");
-        let pad = unsafe { self.inner.GetCurrentPadding()? };
-        if pad == 0 {
-            warn_tagged!(@self, "underflow may happen!");
-        }
-        Ok(pad)
+        unsafe { self.inner.GetCurrentPadding() }
     }
 
     fn Start(&self) -> windows::core::Result<()> {
@@ -1074,9 +1090,19 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
         debug_tagged!(@self, "GetService called, iid: {iid:?}");
         match iid {
             IAudioRenderClient::IID if self.align.get() != 0 => unsafe {
-                let hooker_buffer_len = self.hooker.GetBufferSize().unwrap_or_else(|_| {
-                    self.get_info().current_buffer_len + self.get_info().fundamental
-                });
+                let hooker_buffer_len = match (
+                    self.hooker.GetBufferSize().ok(),
+                    self.info.config.target_buf_len(self.get_info()),
+                ) {
+                    (None, None) => self.get_info().current_period + self.get_info().fundamental,
+                    (None, Some(len)) => {
+                        len.clamp(self.get_info().current_period, self.inner.GetBufferSize()?)
+                    }
+                    (Some(hooker_buf), None) => hooker_buf,
+                    (Some(hooker_buf), Some(len)) => {
+                        len.clamp(self.get_info().current_period, hooker_buf)
+                    }
+                };
                 let inner_buffer_len = self.inner.GetBufferSize()?;
                 let service: IAudioRenderClient = RedirectCompatAudioRenderClient {
                     inner: self.inner.GetService::<IAudioRenderClient>()?,
@@ -1156,7 +1182,7 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
         unsafe {
             client.InitializeSharedAudioStream(
                 streamflags,
-                self.get_info().current_buffer_len,
+                self.get_info().current_period,
                 pformat,
                 Some(audiosessionguid),
             )
@@ -1236,8 +1262,11 @@ impl IAudioRenderClient_Impl for RedirectCompatAudioRenderClient_Impl {
 struct RedirectRingbufAudioClient {
     inner: IAudioClient3,
     info: RedirectClientInfo,
-    buffer: OnceCell<Arc<HeapRb<u8>>>,
+    buffer: OnceCell<u32>,
+    event: Cell<HANDLE>,
+    clear: Arc<AtomicBool>,
     align: Cell<AudioAlign<u32>>,
+    pad: Arc<AtomicU32>,
     outer: OnceCell<IAudioRenderClient>,
     trick: Rc<Cell<bool>>,
     app_handle: Arc<AtomicPtr<c_void>>,
@@ -1249,7 +1278,10 @@ impl RedirectRingbufAudioClient {
             inner,
             info,
             buffer: OnceCell::new(),
+            event: HANDLE::default().into(),
+            clear: AtomicBool::default().into(),
             align: AudioAlign::Normal(0).into(),
+            pad: AtomicU32::default().into(),
             outer: OnceCell::new(),
             trick: Cell::new(true).into(),
             app_handle: AtomicPtr::default().into(),
@@ -1300,12 +1332,8 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
 
     fn GetBufferSize(&self) -> windows::core::Result<u32> {
         if let Some(buf) = self.buffer.get() {
-            let buf = self
-                .align
-                .get()
-                .bytes_to_frames(buf.capacity().get() as u32);
             info_tagged!(@self, "GetBufferSize called, buffer length: {buf}");
-            Ok(buf)
+            Ok(*buf)
         } else {
             unsafe { self.inner.GetBufferSize() }
         }
@@ -1313,8 +1341,8 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
 
     fn GetCurrentPadding(&self) -> windows::core::Result<u32> {
         trace_tagged!(@self, "GetCurrentPadding called");
-        if let Some(buf) = self.buffer.get() {
-            Ok(self.align.get().bytes_to_frames(buf.occupied_len() as u32))
+        if self.buffer.get().is_some() {
+            Ok(self.pad.load(Ordering::Acquire))
         } else {
             unsafe { self.inner.GetCurrentPadding() }
         }
@@ -1334,8 +1362,9 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
     fn Reset(&self) -> windows::core::Result<()> {
         info_tagged!(@self, "Reset called");
         unsafe { self.inner.Reset()? }
-        if let Some(buf) = self.buffer.get() {
-            unsafe { &mut *(Arc::as_ptr(buf).cast_mut()) }.clear();
+        if self.buffer.get().is_some() {
+            self.clear.store(true, Ordering::Relaxed);
+            unsafe { SetEvent(self.event.get())? }
         }
         self.trick.set(true);
         Ok(())
@@ -1362,11 +1391,12 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                     let align = self.align.get().as_usize();
                     let thread_tag = format!("{}-thread", self.info.tag).into_boxed_str();
                     let client_tag = format!("{}-render", self.info.tag).into();
-                    let buffer = unsafe { self.buffer.get().unwrap_unchecked() };
+                    let buffer = align
+                        .frames_to_bytes(*unsafe { self.buffer.get().unwrap_unchecked() } as usize);
                     let event_handle = unsafe { CreateEventW(None, false, false, None)? };
                     let stop_flag = Arc::new(AtomicBool::default());
                     unsafe { self.inner.SetEventHandle(event_handle)? }
-                    let (producer, consumer) = buffer.clone().split();
+                    let (producer, consumer) = RingBuffer::new(buffer);
                     unsafe { RtwqStartup()? };
                     let (mut _task_id, mut thread_id) = (0, 0);
                     unsafe {
@@ -1377,6 +1407,13 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                             &mut thread_id,
                         )?
                     };
+                    let buf_size = unsafe { self.inner.GetBufferSize()? };
+                    let real_size =
+                        if let Some(len) = self.info.config.target_buf_len(self.get_info()) {
+                            len.clamp(self.get_info().current_period, buf_size)
+                        } else {
+                            buf_size
+                        };
                     info_tagged!(@self,"Creating thread");
                     let callback = RedirectRingbufThread {
                         stop_flag: stop_flag.clone(),
@@ -1385,7 +1422,9 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                         app_handle: self.app_handle.clone(),
                         event_handle,
                         buffer: consumer.into(),
-                        real_len: unsafe { self.inner.GetBufferSize()? },
+                        pad: self.pad.clone(),
+                        clear: self.clear.clone(),
+                        real_len: real_size,
                         inner: unsafe { self.inner.GetService::<IAudioRenderClient>()? },
                         align,
                         tag: thread_tag,
@@ -1395,7 +1434,7 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                     unsafe { RtwqPutWaitingWorkItem(event_handle, 1, &result, None)? }
                     let client: IAudioRenderClient = RedirectRingbufAudioRenderClient {
                         buffer: producer.into(),
-                        cache: vec![0u8; buffer.capacity().get()].into_boxed_slice().into(),
+                        cache: vec![0u8; buffer].into_boxed_slice().into(),
                         align,
                         trick: self.trick.clone(),
                         tag: client_tag,
@@ -1469,20 +1508,11 @@ impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
                 self.inner.SetClientProperties(&properties)?;
             }
             let align = (*pformat).nBlockAlign;
-            let buf_len = if let Some(buf) = target_config
-                .ring_buffer_len
-                .get(&self.get_info().samplerate)
-                .copied()
-                && buf != 0
-            {
-                self.get_info()
-                    .current_buffer_len
-                    .max(buf.div_ceil(self.get_info().fundamental) * self.get_info().fundamental)
-            } else {
-                self.get_info().current_buffer_len * 10
-            };
-            let buffer = Arc::new(HeapRb::new(buf_len as usize * align as usize));
-            _ = self.buffer.set(buffer.clone());
+            let buf_len = target_config
+                .ring_buf_len(self.get_info())
+                .unwrap_or_else(|| self.get_info().current_period * 10);
+            // let buffer = Arc::new(HeapRb::new(buf_len as usize * align as usize));
+            _ = self.buffer.set(buf_len);
             self.align.set(AudioAlign::new(align as u32));
             if streamflags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK == 0 {
                 info_tagged!(@self, "Injecting event flag");
@@ -1492,7 +1522,7 @@ impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
             }
             self.inner.InitializeSharedAudioStream(
                 streamflags,
-                self.get_info().current_buffer_len,
+                self.get_info().current_period,
                 pformat,
                 Some(audiosessionguid),
             )
@@ -1506,13 +1536,15 @@ struct RedirectRingbufThread {
     stop_flag: Arc<AtomicBool>,
     thread_id: u32,
     event_handle: HANDLE,
-    app_handle: Arc<AtomicPtr<c_void>>,
-    buffer: UnsafeCell<CachingCons<Arc<HeapRb<u8>>>>,
+    buffer: UnsafeCell<Consumer<u8>>,
+    pad: Arc<AtomicU32>,
     client: IAudioClient3,
     align: AudioAlign<usize>,
     real_len: u32,
+    clear: Arc<AtomicBool>,
     inner: IAudioRenderClient,
     tag: Box<str>,
+    app_handle: Arc<AtomicPtr<c_void>>,
 }
 impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
     fn GetParameters(&self, pdwflags: *mut u32, pdwqueue: *mut u32) -> windows_core::Result<()> {
@@ -1528,45 +1560,52 @@ impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
     ) -> windows_core::Result<()> {
         if self.stop_flag.load(Ordering::Relaxed) {
             return Ok(());
+        } else {
+            unsafe { RtwqPutWaitingWorkItem(self.event_handle, 1, pasyncresult.as_ref(), None)? }
+        }
+        if self.clear.load(Ordering::Relaxed) {
+            while unsafe { &mut *self.buffer.get() }.pop().is_ok() {}
+            self.pad.store(0, Ordering::Relaxed);
+            return Ok(());
         }
         let buffer = unsafe { &mut *self.buffer.get() };
         if buffer.is_empty() {
             let pad = unsafe { self.client.GetCurrentPadding()? };
             if pad == 0 {
-                warn_tagged!(self.tag, "buffer is empty, underflow may happen!");
+                warn_tagged!(self.tag, "buffer is empty, underflow may happen!")
             } else {
-                debug_tagged!(self.tag, "mid-buffer empty, data in client buffer: {pad}");
+                debug_tagged!(self.tag, "mid-buffer empty, data in client buffer: {pad}")
             }
-            unsafe {
-                if let Some(handle) = self.app_handle.load(Ordering::Relaxed).as_mut() {
-                    SetEvent(HANDLE(handle)).ok();
-                }
-                RtwqPutWaitingWorkItem(self.event_handle, 1, pasyncresult.as_ref(), None)?;
-            }
-            return Ok(());
-        }
-        let read_len = self.align.bytes_to_frames(buffer.occupied_len());
-        let write_len =
-            read_len.min((self.real_len - unsafe { self.client.GetCurrentPadding()? }) as usize);
-        let slice = unsafe {
-            from_raw_parts_mut(
-                self.inner.GetBuffer(write_len as u32)?,
-                self.align.frames_to_bytes(write_len),
-            )
-        };
-        buffer.pop_slice(slice);
-        unsafe {
-            self.inner.ReleaseBuffer(write_len as u32, 0)?;
+        } else {
+            let read_len = self.align.bytes_to_frames(buffer.slots());
+            let write_len = read_len
+                .min((self.real_len - unsafe { self.client.GetCurrentPadding()? }) as usize);
+            let slice = unsafe {
+                from_raw_parts_mut(
+                    self.inner.GetBuffer(write_len as u32)?,
+                    self.align.frames_to_bytes(write_len),
+                )
+            };
+            buffer
+                .pop_entire_slice(slice)
+                .unwrap_or_else(|e| warn_tagged!(self.tag, "pop overflow! {e}"));
+            self.pad.store(
+                self.align.bytes_to_frames(buffer.cached_slots()) as u32,
+                Ordering::Release,
+            );
+            unsafe { self.inner.ReleaseBuffer(write_len as u32, 0)? };
             trace_tagged!(
                 self.tag,
                 "data in mid-buffer: {read_len}, written: {write_len}"
-            );
+            )
+        }
+        unsafe {
             if let Some(handle) = self.app_handle.load(Ordering::Relaxed).as_mut() {
-                SetEvent(HANDLE(handle)).ok();
+                SetEvent(HANDLE(handle))
+            } else {
+                Ok(())
             }
-            RtwqPutWaitingWorkItem(self.event_handle, 1, pasyncresult.as_ref(), None)?;
-        };
-        Ok(())
+        }
     }
 }
 impl Drop for RedirectRingbufThread {
@@ -1585,7 +1624,7 @@ impl Drop for RedirectRingbufThread {
 
 #[implement(IAudioRenderClient)]
 struct RedirectRingbufAudioRenderClient {
-    buffer: UnsafeCell<CachingProd<Arc<HeapRb<u8>>>>,
+    buffer: UnsafeCell<Producer<u8>>,
     cache: UnsafeCell<Box<[u8]>>,
     align: AudioAlign<usize>,
     trick: Rc<Cell<bool>>,
@@ -1609,10 +1648,6 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
     }
     fn ReleaseBuffer(&self, numframeswritten: u32, dwflags: u32) -> windows::core::Result<()> {
         if numframeswritten == 0 {
-            warn_tagged!(
-                self.tag,
-                "no data written in this release call, overflow may happen!"
-            );
             return Ok(());
         }
         if self.trick.get() {
@@ -1632,11 +1667,12 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
             if dwflags == 2 {
                 slice.fill(0);
             }
-            let written_len = buffer.push_slice(slice);
+            buffer
+                .push_entire_slice(slice)
+                .unwrap_or_else(|e| warn_tagged!(self.tag, "push overflow! {e}"));
             debug_tagged!(
                 self.tag,
-                "ReleaseBuffer called, written: {}",
-                self.align.bytes_to_frames(written_len)
+                "ReleaseBuffer called, written: {numframeswritten}"
             )
         };
         Ok(())
