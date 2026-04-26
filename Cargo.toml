@@ -13,6 +13,7 @@ windows = { version = "0.62.*", features = [
     "Win32_Security",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Media_Audio_Endpoints",
+    "Win32_System_LibraryLoader",
 ] }
 log = "0.4.*"
 retour = "0.4.0-alpha.4"

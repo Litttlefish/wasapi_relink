@@ -15,6 +15,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::slice::from_raw_parts_mut;
 use std::sync::{Arc, LazyLock, Once, OnceLock, atomic::*};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
 use windows::{
     Win32::{
@@ -230,8 +231,23 @@ static CO_CREATE: LazyLock<(
 )> = LazyLock::new(|| unsafe {
     link!("combase.dll" "system" fn CoCreateInstance(rclsid : *const GUID, punkouter : *mut c_void, dwclscontext : CLSCTX, riid : *const GUID, ppv : *mut *mut c_void) -> HRESULT);
     link!("combase.dll" "system" fn CoCreateInstanceEx(clsid : *const GUID, punkouter : *mut c_void, dwclsctx : CLSCTX, pserverinfo : *const COSERVERINFO, dwcount : u32, presults : *mut MULTI_QI) -> HRESULT);
-    let func: FnCoCreateInstance = transmute(CoCreateInstance as *mut c_void);
-    let funcex: FnCoCreateInstanceEx = transmute(CoCreateInstanceEx as *mut c_void);
+    let (func, funcex): (FnCoCreateInstance, FnCoCreateInstanceEx) =
+        GetModuleHandleW(w!("combase"))
+            .map(|hmodule| {
+                (
+                    transmute(
+                        GetProcAddress(hmodule, s!("CoCreateInstance"))
+                            .map_or_else(|| CoCreateInstance as *mut c_void, |f| f as *mut c_void),
+                    ),
+                    transmute(
+                        GetProcAddress(hmodule, s!("CoCreateInstanceEx")).map_or_else(
+                            || CoCreateInstanceEx as *mut c_void,
+                            |f| f as *mut c_void,
+                        ),
+                    ),
+                )
+            })
+            .unwrap();
     (
         GenericDetour::new(func, hooked_cocreateinstance).unwrap(),
         GenericDetour::new(funcex, hooked_cocreateinstanceex).unwrap(),
@@ -1177,8 +1193,7 @@ impl IAudioRenderClient_Impl for RedirectCompatAudioRenderClient_Impl {
                     );
                     self.apply_data(self.buffer_len.1, dwflags)
                 } else {
-                    info_tagged!(self.tag, "already filled, discarding");
-                    Ok(())
+                    Ok(info_tagged!(self.tag, "already filled, discarding"))
                 }
             } else {
                 self.apply_data(numframeswritten, dwflags)
@@ -1218,14 +1233,12 @@ impl RedirectRingbufAudioClient {
     }
     fn set_buffer(&self, param: &Shared3Info) {
         self.buffer.update(|x| {
-            if x == 0 {
+            (x != 0).then_some(x).unwrap_or_else(|| {
                 self.info
                     .config
                     .ring_buf_len(param)
                     .unwrap_or_else(|| param.current_period * 10)
-            } else {
-                x
-            }
+            })
         })
     }
 }
@@ -1313,11 +1326,10 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
             let outer: &RedirectRingbufAudioRenderClient = unsafe { outer.as_impl() };
             let buf = unsafe { &*outer.buffer.get() };
             let len = self.buffer.get();
-            Ok(if buf.is_full() {
-                len
-            } else {
-                len - self.align.get().bytes_to_frames(buf.slots()) as u32
-            })
+            Ok(buf
+                .is_full()
+                .then_some(len)
+                .unwrap_or_else(|| len - self.align.get().bytes_to_frames(buf.slots()) as u32))
         } else {
             unsafe { self.inner.GetCurrentPadding() }
         }
@@ -1360,8 +1372,7 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
     fn SetEventHandle(&self, eventhandle: HANDLE) -> windows::core::Result<()> {
         info_tagged!(@self, "SetEventHandle called");
         if self.info.initialized() {
-            self.app_handle.set(Some(eventhandle));
-            Ok(())
+            Ok(self.app_handle.set(Some(eventhandle)))
         } else {
             unsafe { self.inner.SetEventHandle(eventhandle) }
         }
@@ -1632,12 +1643,11 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
             buffer
                 .push_entire_slice(slice)
                 .unwrap_or_else(|e| warn_tagged!(self.tag, "push overflow! {e}"));
-            debug_tagged!(
+            Ok(debug_tagged!(
                 self.tag,
                 "ReleaseBuffer called, written: {numframeswritten}"
-            )
-        };
-        Ok(())
+            ))
+        }
     }
 }
 impl Drop for RedirectRingbufAudioRenderClient {
