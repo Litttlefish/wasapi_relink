@@ -232,22 +232,20 @@ static CO_CREATE: LazyLock<(
     link!("combase.dll" "system" fn CoCreateInstance(rclsid : *const GUID, punkouter : *mut c_void, dwclscontext : CLSCTX, riid : *const GUID, ppv : *mut *mut c_void) -> HRESULT);
     link!("combase.dll" "system" fn CoCreateInstanceEx(clsid : *const GUID, punkouter : *mut c_void, dwclsctx : CLSCTX, pserverinfo : *const COSERVERINFO, dwcount : u32, presults : *mut MULTI_QI) -> HRESULT);
     let (func, funcex): (FnCoCreateInstance, FnCoCreateInstanceEx) =
-        GetModuleHandleW(w!("combase"))
-            .map(|hmodule| {
-                (
-                    transmute(
-                        GetProcAddress(hmodule, s!("CoCreateInstance"))
-                            .map_or_else(|| CoCreateInstance as *mut c_void, |f| f as *mut c_void),
-                    ),
-                    transmute(
-                        GetProcAddress(hmodule, s!("CoCreateInstanceEx")).map_or_else(
-                            || CoCreateInstanceEx as *mut c_void,
-                            |f| f as *mut c_void,
-                        ),
-                    ),
-                )
-            })
-            .unwrap();
+        GetModuleHandleW(w!("combase")).map_or_else(
+            |_| {
+                transmute((
+                    CoCreateInstance as *mut c_void,
+                    CoCreateInstanceEx as *mut c_void,
+                ))
+            },
+            |hmodule| {
+                transmute((
+                    GetProcAddress(hmodule, s!("CoCreateInstance")).unwrap() as *mut c_void,
+                    GetProcAddress(hmodule, s!("CoCreateInstanceEx")).unwrap() as *mut c_void,
+                ))
+            },
+        );
     (
         GenericDetour::new(func, hooked_cocreateinstance).unwrap(),
         GenericDetour::new(funcex, hooked_cocreateinstanceex).unwrap(),
