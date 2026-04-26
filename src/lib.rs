@@ -232,20 +232,20 @@ static CO_CREATE: LazyLock<(
     link!("combase.dll" "system" fn CoCreateInstance(rclsid : *const GUID, punkouter : *mut c_void, dwclscontext : CLSCTX, riid : *const GUID, ppv : *mut *mut c_void) -> HRESULT);
     link!("combase.dll" "system" fn CoCreateInstanceEx(clsid : *const GUID, punkouter : *mut c_void, dwclsctx : CLSCTX, pserverinfo : *const COSERVERINFO, dwcount : u32, presults : *mut MULTI_QI) -> HRESULT);
     let (func, funcex): (FnCoCreateInstance, FnCoCreateInstanceEx) =
-        GetModuleHandleW(w!("combase")).map_or_else(
+        transmute(GetModuleHandleW(w!("combase")).map_or_else(
             |_| {
-                transmute((
+                (
                     CoCreateInstance as *mut c_void,
                     CoCreateInstanceEx as *mut c_void,
-                ))
+                )
             },
             |hmodule| {
-                transmute((
+                (
                     GetProcAddress(hmodule, s!("CoCreateInstance")).unwrap() as *mut c_void,
                     GetProcAddress(hmodule, s!("CoCreateInstanceEx")).unwrap() as *mut c_void,
-                ))
+                )
             },
-        );
+        ));
     (
         GenericDetour::new(func, hooked_cocreateinstance).unwrap(),
         GenericDetour::new(funcex, hooked_cocreateinstanceex).unwrap(),
@@ -1191,7 +1191,8 @@ impl IAudioRenderClient_Impl for RedirectCompatAudioRenderClient_Impl {
                     );
                     self.apply_data(self.buffer_len.1, dwflags)
                 } else {
-                    Ok(info_tagged!(self.tag, "already filled, discarding"))
+                    info_tagged!(self.tag, "already filled, discarding");
+                    Ok(())
                 }
             } else {
                 self.apply_data(numframeswritten, dwflags)
@@ -1231,12 +1232,16 @@ impl RedirectRingbufAudioClient {
     }
     fn set_buffer(&self, param: &Shared3Info) {
         self.buffer.update(|x| {
-            (x != 0).then_some(x).unwrap_or_else(|| {
-                self.info
-                    .config
-                    .ring_buf_len(param)
-                    .unwrap_or_else(|| param.current_period * 10)
-            })
+            if x != 0 {
+                x
+            } else {
+                {
+                    self.info
+                        .config
+                        .ring_buf_len(param)
+                        .unwrap_or_else(|| param.current_period * 10)
+                }
+            }
         })
     }
 }
@@ -1324,10 +1329,11 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
             let outer: &RedirectRingbufAudioRenderClient = unsafe { outer.as_impl() };
             let buf = unsafe { &*outer.buffer.get() };
             let len = self.buffer.get();
-            Ok(buf
-                .is_full()
-                .then_some(len)
-                .unwrap_or_else(|| len - self.align.get().bytes_to_frames(buf.slots()) as u32))
+            Ok(if buf.is_full() {
+                len
+            } else {
+                len - self.align.get().bytes_to_frames(buf.slots()) as u32
+            })
         } else {
             unsafe { self.inner.GetCurrentPadding() }
         }
@@ -1370,7 +1376,8 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
     fn SetEventHandle(&self, eventhandle: HANDLE) -> windows::core::Result<()> {
         info_tagged!(@self, "SetEventHandle called");
         if self.info.initialized() {
-            Ok(self.app_handle.set(Some(eventhandle)))
+            self.app_handle.set(Some(eventhandle));
+            Ok(())
         } else {
             unsafe { self.inner.SetEventHandle(eventhandle) }
         }
@@ -1379,7 +1386,6 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
     fn GetService(&self, riid: *const GUID, ppv: *mut *mut c_void) -> windows::core::Result<()> {
         let iid = unsafe { *riid };
         debug_tagged!(@self, "GetService called, iid: {iid:?}");
-        if iid == IAudioRenderClient::IID && self.info.initialized() {}
         match iid {
             IAudioRenderClient::IID if self.info.initialized() => {
                 if let Some((client, _)) = self.outer.get() {
@@ -1641,10 +1647,11 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
             buffer
                 .push_entire_slice(slice)
                 .unwrap_or_else(|e| warn_tagged!(self.tag, "push overflow! {e}"));
-            Ok(debug_tagged!(
+            debug_tagged!(
                 self.tag,
                 "ReleaseBuffer called, written: {numframeswritten}"
-            ))
+            );
+            Ok(())
         }
     }
 }
