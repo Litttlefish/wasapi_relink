@@ -144,6 +144,8 @@ target_period_hus = 20
 target_buffer_len.48000 = 256
 # (通用) 为此流启用原始处理 (bool)。
 raw = true
+# (通用) 在初始化前报告修改后的周期长度。
+force_period = true
 
 [playback]
 
@@ -182,6 +184,8 @@ compat_buffer_dur_hns.96000 = 238350
     - 注：有效范围为[`设备周期`, `完整缓冲长度`]，其它数值会被限制到此范围。会自动将该数值向上取整至驱动基础周期的整数倍。
 
   - `raw` (bool): 表示此流是否使用**原始音频流**，该模式下会绕过绝大多数APO。`Bypass` 模式下此项无效。
+
+  - `force_period` (bool): 表示此流会在 `Initialize` 前的 `GetDevicePeriod` 调用里返回修改后的周期。`Bypass` 模式下此项无效。
 
   - `ring_buffer_len.<samplerate>` (u32): 环形缓冲区的目标尺寸，单位为**音频帧**。**推荐在环缓模式下设置一个合理的值。**
     - 注：工具会自动将该数值向上取整至驱动基础周期的整数倍，以保证流畅播放。

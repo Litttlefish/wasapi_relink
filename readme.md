@@ -144,6 +144,8 @@ target_period_hus = 20
 target_buffer_len.48000 = 256
 # (General) Enable raw process for this stream (bool).
 raw = true
+# (General) Report spoofed period before client initialize.
+force_period = true
 
 [playback]
 
@@ -184,6 +186,8 @@ compat_buffer_dur_hns.96000 = 238350
     - Note: Valid range is [`device_period`, `full_buffer_len`], other value will be clamped. Will automatically round this value *UP* to the nearest multiple of the driver’s fundamental period.
 
   - `raw` (bool): Indicates this stream to use **raw processing**, which bypasses most APO. Does nothing when mode is `Bypass`.
+
+  - `force_period` (bool): Will report spoofed period in `GetDevicePeriod` calls before `Initialize`. Does nothing when mode is `Bypass`.
 
   - `ring_buffer_len.<samplerate>` (u32): Target buffer length for the ring buffer in **audio frames**. **It's recommended to set a proper value in Ringbuf mode.**
     - Note: The tool will automatically round this value *UP* to the nearest multiple of fundamental period to ensure smooth streaming and prevent micro-glitches.
