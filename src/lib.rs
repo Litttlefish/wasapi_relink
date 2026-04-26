@@ -12,9 +12,8 @@ use std::mem::transmute;
 use std::num::NonZero;
 use std::os::raw::c_void;
 use std::path::Path;
-use std::rc::Rc;
 use std::slice::from_raw_parts_mut;
-use std::sync::{Arc, LazyLock, Once, OnceLock, atomic::*};
+use std::sync::{LazyLock, Once, OnceLock, atomic::*};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
 use windows::{
@@ -911,7 +910,7 @@ struct RedirectCompatAudioClient {
     inner: IAudioClient3,
     hooker: IAudioClient3,
     info: RedirectClientInfo,
-    trick: Rc<Cell<bool>>,
+    outer: OnceCell<IAudioRenderClient>,
     align: Cell<u16>,
 }
 
@@ -921,7 +920,7 @@ impl RedirectCompatAudioClient {
             inner,
             hooker,
             info,
-            trick: Cell::new(true).into(),
+            outer: OnceCell::new(),
             align: 0.into(),
         }
     }
@@ -1003,7 +1002,10 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
 
     fn Start(&self) -> windows::core::Result<()> {
         info_tagged!(@self, "Start called");
-        self.trick.set(false);
+        if let Some(client) = self.outer.get() {
+            let client: &RedirectCompatAudioRenderClient = unsafe { client.as_impl() };
+            client.trick.set(false);
+        }
         unsafe {
             _ = self.hooker.Start();
             self.inner.Start()
@@ -1020,7 +1022,10 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
 
     fn Reset(&self) -> windows::core::Result<()> {
         info_tagged!(@self, "Reset called");
-        self.trick.set(true);
+        if let Some(client) = self.outer.get() {
+            let client: &RedirectCompatAudioRenderClient = unsafe { client.as_impl() };
+            client.trick.set(true);
+        }
         unsafe {
             _ = self.hooker.Reset();
             self.inner.Reset()
@@ -1040,32 +1045,38 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
         debug_tagged!(@self, "GetService called, iid: {iid:?}");
         match iid {
             IAudioRenderClient::IID if self.info.initialized() => {
-                let param = self.info.param(&self.inner)?;
-                let hooker_buffer_len = match (
-                    unsafe { self.hooker.GetBufferSize().ok() },
-                    self.info.config.target_buf_len(param),
-                ) {
-                    (None, None) => param.current_period + param.fundamental,
-                    (None, Some(len)) => {
-                        len.clamp(param.current_period, unsafe { self.inner.GetBufferSize()? })
+                if let Some(client) = self.outer.get() {
+                    unsafe { client.query(riid, ppv).ok() }
+                } else {
+                    let param = self.info.param(&self.inner)?;
+                    let hooker_buffer_len = match (
+                        unsafe { self.hooker.GetBufferSize().ok() },
+                        self.info.config.target_buf_len(param),
+                    ) {
+                        (None, None) => param.current_period + param.fundamental,
+                        (None, Some(len)) => {
+                            len.clamp(param.current_period, unsafe { self.inner.GetBufferSize()? })
+                        }
+                        (Some(hooker_buf), None) => hooker_buf,
+                        (Some(hooker_buf), Some(len)) => {
+                            len.clamp(param.current_period, hooker_buf)
+                        }
+                    };
+                    let inner_buffer_len = unsafe { self.inner.GetBufferSize()? };
+                    let align = AudioAlign::new(self.align.get());
+                    let service: IAudioRenderClient = RedirectCompatAudioRenderClient {
+                        inner: unsafe { self.inner.GetService::<IAudioRenderClient>()? },
+                        trick_buffer: vec![0; align.frames_to_bytes(inner_buffer_len as usize)]
+                            .into_boxed_slice()
+                            .into(),
+                        trick: true.into(),
+                        align,
+                        buffer_len: (inner_buffer_len, hooker_buffer_len),
+                        tag: format!("{}-client", self.info.tag).into(),
                     }
-                    (Some(hooker_buf), None) => hooker_buf,
-                    (Some(hooker_buf), Some(len)) => len.clamp(param.current_period, hooker_buf),
-                };
-                let inner_buffer_len = unsafe { self.inner.GetBufferSize()? };
-                let align = AudioAlign::new(self.align.get());
-                let service: IAudioRenderClient = RedirectCompatAudioRenderClient {
-                    inner: unsafe { self.inner.GetService::<IAudioRenderClient>()? },
-                    trick_buffer: vec![0; align.frames_to_bytes(inner_buffer_len as usize)]
-                        .into_boxed_slice()
-                        .into(),
-                    trick: self.trick.clone(),
-                    align,
-                    buffer_len: (inner_buffer_len, hooker_buffer_len),
-                    tag: format!("{}-client", self.info.tag).into(),
+                    .into();
+                    unsafe { service.query(riid, ppv).ok() }
                 }
-                .into();
-                unsafe { service.query(riid, ppv).ok() }
             }
             _ => unsafe {
                 (self.inner.cast::<IAudioClient>()?.vtable().GetService)(
@@ -1146,7 +1157,7 @@ drop_boilerplate!(RedirectCompatAudioClient);
 struct RedirectCompatAudioRenderClient {
     inner: IAudioRenderClient,
     trick_buffer: UnsafeCell<Box<[u8]>>,
-    trick: Rc<Cell<bool>>,
+    trick: Cell<bool>,
     align: AudioAlign,
     buffer_len: (u32, u32),
     tag: Box<str>,
@@ -1397,7 +1408,6 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                     let client_tag = format!("{}-render", self.info.tag).into();
                     let buffer = align.frames_to_bytes(self.buffer.get() as usize);
                     let event_handle = unsafe { CreateEventW(None, false, false, None)? };
-                    let stop_flag = Arc::new(AtomicBool::default());
                     unsafe { self.inner.SetEventHandle(event_handle)? }
                     let (producer, consumer) = RingBuffer::new(buffer);
                     unsafe { RtwqStartup()? };
@@ -1411,7 +1421,6 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                     };
                     info_tagged!(@self,"Creating thread");
                     let callback = RedirectRingbufThread {
-                        stop_flag: stop_flag.clone(),
                         thread_id: ids[1],
                         client: self.inner.clone(),
                         app_handle: self.app_handle.clone(),
@@ -1432,7 +1441,6 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                         align,
                         trick: true.into(),
                         tag: client_tag,
-                        thread: stop_flag,
                     }
                     .into();
                     let ret = unsafe { client.query(riid, ppv) }.ok();
@@ -1524,7 +1532,6 @@ drop_boilerplate!(RedirectRingbufAudioClient);
 
 #[implement(IRtwqAsyncCallback)]
 struct RedirectRingbufThread {
-    stop_flag: Arc<AtomicBool>,
     thread_id: u32,
     event: Owned<HANDLE>,
     buffer: UnsafeCell<Consumer<u8>>,
@@ -1548,7 +1555,8 @@ impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
         &self,
         pasyncresult: windows_core::Ref<IRtwqAsyncResult>,
     ) -> windows_core::Result<()> {
-        if self.stop_flag.load(Ordering::Relaxed) {
+        let buffer = unsafe { &mut *self.buffer.get() };
+        if buffer.is_abandoned() {
             return Ok(());
         } else {
             unsafe { RtwqPutWaitingWorkItem(*self.event, 1, pasyncresult.as_ref(), None)? }
@@ -1556,7 +1564,6 @@ impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
                 return Ok(());
             }
         }
-        let buffer = unsafe { &mut *self.buffer.get() };
         if buffer.is_empty() {
             let pad = unsafe { self.client.GetCurrentPadding()? };
             if pad == 0 {
@@ -1606,7 +1613,6 @@ struct RedirectRingbufAudioRenderClient {
     align: AudioAlign,
     trick: Cell<bool>,
     tag: Box<str>,
-    thread: Arc<AtomicBool>,
 }
 impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
     fn GetBuffer(&self, numframesrequested: u32) -> windows::core::Result<*mut u8> {
@@ -1658,7 +1664,6 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
 impl Drop for RedirectRingbufAudioRenderClient {
     fn drop(&mut self) {
         info_tagged!(self.tag, "Stopping consumer thread");
-        self.thread.store(true, Ordering::Relaxed);
     }
 }
 
