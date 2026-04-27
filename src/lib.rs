@@ -74,15 +74,13 @@ struct RedirectConfig {
 }
 impl RedirectConfig {
     fn load() -> Self {
-        if let Ok(str) = std::fs::read_to_string("redirect_config.toml") {
-            if let Ok(cfg) = toml::from_str::<RedirectConfig>(&str) {
-                cfg
-            } else {
-                Self::new_with_source(ConfigSource::NoParse)
-            }
-        } else {
-            Self::new_with_source(ConfigSource::NoFile)
-        }
+        std::fs::read_to_string("redirect_config.toml").map_or_else(
+            |_| Self::new_with_source(ConfigSource::NoFile),
+            |str| {
+                toml::from_str::<RedirectConfig>(&str)
+                    .unwrap_or_else(|_| Self::new_with_source(ConfigSource::NoParse))
+            },
+        )
     }
     fn new_with_source(source: ConfigSource) -> Self {
         Self {
@@ -799,11 +797,10 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
         if self.info.initialized() {
             let real_size = unsafe { self.inner.GetBufferSize()? };
             let param = self.info.param(&self.inner)?;
-            let buf = if let Some(len) = self.info.config.target_buf_len(param) {
-                len.clamp(param.current_period, real_size)
-            } else {
-                real_size
-            };
+            let buf = self.info.config.target_buf_len(param).map_or_else(
+                || real_size,
+                |len| len.clamp(param.current_period, real_size),
+            );
             info_tagged!(@self, "GetBufferSize called, buffer length: {buf}");
             Ok(buf)
         } else {
@@ -1414,11 +1411,11 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                     let mut ids = [0; 2];
                     unsafe { RtwqLockSharedWorkQueue(w!("Audio"), 1, &mut ids[0], &mut ids[1])? };
                     let buf_size = unsafe { self.inner.GetBufferSize()? };
-                    let real_size = if let Some(len) = self.info.config.target_buf_len(param) {
-                        len.clamp(param.current_period, buf_size)
-                    } else {
-                        buf_size
-                    };
+                    let real_size = self
+                        .info
+                        .config
+                        .target_buf_len(param)
+                        .map_or_else(|| buf_size, |len| len.clamp(param.current_period, buf_size));
                     info_tagged!(@self,"Creating thread");
                     let callback = RedirectRingbufThread {
                         thread_id: ids[1],
