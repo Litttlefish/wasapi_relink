@@ -26,7 +26,7 @@ compat和ringbuf中,尤其是ringbuf里对异步线程强行使用了as_impl,这
 
 对于生产端已知如下前提:
 
-线程需要先调用GetPadding确认写入量,然后才能Get/Release,这两个操作一个在IAudioClient(as_impl强行读取地方),一个在IAudioRenderClient(也就是生产端实际在的地方),显然这个操作有明确顺序要求,且限制了单线程,所以是安全的,对trick的修改也是同理
+线程需要先调用GetPadding确认写入量,然后才能Get/Release,这两个操作一个在IAudioClient(as_impl强行读取地方),一个在IAudioRenderClient(也就是生产端实际在的地方),显然这个操作有明确顺序要求,且限制了单线程,所以是安全的
 
 对于消费端,由于开头需要先检查生产端是否drop,这一步需要解引用,所以常规意义的UB不可避(悲)
 
@@ -65,4 +65,4 @@ ringbuf模式使用了一个异步线程,乍一看会引入线程安全问题
 
 对于IAudioClient的"可变"(start/stop/init什么的)占用都在应用线程完成,而且基于前面as_impl安全的描述不会出现多个同时写入操作,撑死了也就是一个stop的时候另一个getpadding,而这个行为wasapi是允许的
 
-应用侧的render client用了`Cell<bool>`,它的get/release对是一定单线程完成的(依旧是wasapi要求,应该也没应用没事找事强行多线程操作),而对于start/reset,此时应用侧写入要么还没开始,要么已经停了(不然它reset干嘛),再基于阻塞时序,直接as_impl写入还是没问题的
+应用侧的render client里,trick用了`Cell<bool>`,它的get/release对是一定单线程完成的(依旧是wasapi要求,应该也没应用没事找事强行多线程操作),而对于start/reset,此时应用侧写入要么还没开始,要么已经停了(不然它reset干嘛),再基于阻塞时序,直接as_impl写入还是没问题的
