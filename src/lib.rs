@@ -1326,12 +1326,19 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
 
     fn Start(&self) -> WinResult<()> {
         info_tagged!(@self, "Start called");
-        if let Some((outer, thread)) = self.outer.get() {
+        if let Some((outer, rthread)) = self.outer.get() {
             let outer: &RedirectRingbufAudioRenderClient = unsafe { outer.as_impl() };
             outer.trick.set(false);
-            let thread: &RedirectRingbufThread = unsafe { thread.as_impl() };
-            (!self.app_handle.get().is_invalid())
-                .then(|| thread.app_handle.get_or_init(|| self.app_handle.get()));
+            let thread: &RedirectRingbufThread = unsafe { rthread.as_impl() };
+            if !thread.init.is_completed() {
+                let result = unsafe { RtwqCreateAsyncResult(None, rthread, None)? };
+                thread.init.call_once(|| {
+                    thread.app_handle.set(
+                        (!self.app_handle.get().is_invalid()).then_some(self.app_handle.get()),
+                    );
+                });
+                unsafe { RtwqPutWorkItem(thread.thread_id, 1, &result)? }
+            }
             thread.pause.store(false, Ordering::Relaxed);
         }
         unsafe { self.inner.Start() }
@@ -1398,14 +1405,12 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                         align,
                         real_len: real_size,
                         event: unsafe { Owned::new(event_handle) },
-                        app_handle: OnceCell::new(),
+                        app_handle: None.into(),
                         thread_id: ids[1],
                         tag: format!("{}-thread", self.info.tag).into(),
                         pause: false.into(),
+                        init: Once::new(),
                     };
-                    let callback: IRtwqAsyncCallback = callback.into();
-                    let result = unsafe { RtwqCreateAsyncResult(None, &callback, None)? };
-                    unsafe { RtwqPutWorkItem(ids[1], 1, &result)? }
                     let client: IAudioRenderClient = RedirectRingbufAudioRenderClient {
                         buffer: producer.into(),
                         cache: vec![0u8; buffer].into_boxed_slice().into(),
@@ -1415,7 +1420,7 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                     }
                     .into();
                     let ret = unsafe { client.query(riid, ppv) }.ok();
-                    _ = self.outer.set((client, callback));
+                    _ = self.outer.set((client, callback.into()));
                     ret
                 }
             }
@@ -1505,10 +1510,11 @@ struct RedirectRingbufThread {
     align: AudioAlign,
     real_len: u32,
     event: Owned<HANDLE>,
-    app_handle: OnceCell<HANDLE>,
+    app_handle: Cell<Option<HANDLE>>,
     thread_id: u32,
     tag: Box<str>,
     pause: AtomicBool,
+    init: Once,
 }
 impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
     fn GetParameters(&self, _: *mut u32, pdwqueue: *mut u32) -> WinResult<()> {
@@ -1551,7 +1557,7 @@ impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
                 "data in mid-buffer: {read_len}, written: {write_len}"
             )
         }
-        unsafe { self.app_handle.get().map_or(Ok(()), |&h| SetEvent(h)) }
+        unsafe { self.app_handle.get().map_or(Ok(()), |h| SetEvent(h)) }
     }
 }
 impl Drop for RedirectRingbufThread {
