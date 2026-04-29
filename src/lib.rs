@@ -1405,7 +1405,7 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                     };
                     let callback: IRtwqAsyncCallback = callback.into();
                     let result = unsafe { RtwqCreateAsyncResult(None, &callback, None)? };
-                    unsafe { RtwqPutWaitingWorkItem(event_handle, 1, &result, None)? }
+                    unsafe { RtwqPutWorkItem(ids[1], 1, &result)? }
                     let client: IAudioRenderClient = RedirectRingbufAudioRenderClient {
                         buffer: producer.into(),
                         cache: vec![0u8; buffer].into_boxed_slice().into(),
