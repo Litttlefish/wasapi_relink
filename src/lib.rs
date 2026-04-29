@@ -238,8 +238,8 @@ static CO_CREATE: LazyLock<(
             },
             |hmodule| {
                 (
-                    GetProcAddress(hmodule, s!("CoCreateInstance")).unwrap() as *mut c_void,
-                    GetProcAddress(hmodule, s!("CoCreateInstanceEx")).unwrap() as *mut c_void,
+                    GetProcAddress(hmodule, s!("CoCreateInstance")).unwrap() as *mut _,
+                    GetProcAddress(hmodule, s!("CoCreateInstanceEx")).unwrap() as *mut _,
                 )
             },
         ));
