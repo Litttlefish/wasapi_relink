@@ -268,9 +268,10 @@ unsafe extern "system" fn hooked_cocreateinstance(
                 trace!("Skipping SpecialK CoCreateInstance calls, thread name: {name}");
             } else {
                 debug!("Intercepted IMMDeviceEnumerator creation via CoCreateInstance");
-                let proxy_enumerator: IMMDeviceEnumerator =
-                    RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(*ppv)).into();
-                *ppv = proxy_enumerator.into_raw();
+                *ppv = IMMDeviceEnumerator::from(RedirectDeviceEnumerator::new(
+                    IMMDeviceEnumerator::from_raw(*ppv),
+                ))
+                .into_raw();
             }
         }
         ret
@@ -301,11 +302,11 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
                 for qi in from_raw_parts_mut(presults, dwcount as usize) {
                     if *qi.pIID == IMMDeviceEnumerator::IID && qi.hr.is_ok() {
                         debug!("Intercepted IMMDeviceEnumerator via CoCreateInstanceEx");
-                        let proxy_enumerator: IMMDeviceEnumerator =
+                        let proxy_enumerator = IMMDeviceEnumerator::from(
                             RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(
                                 qi.pItf.take().unwrap_unchecked().into_raw(),
-                            ))
-                            .into();
+                            )),
+                        );
                         _ = qi.pItf.insert(proxy_enumerator.into())
                     }
                 }
@@ -335,10 +336,9 @@ impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
             "DeviceEnumerator::EnumAudioEndpoints requested on flow {}",
             dataflow.0
         );
-        Ok(RedirectDeviceCollection {
+        Ok(IMMDeviceCollection::from(RedirectDeviceCollection {
             inner: unsafe { self.inner.EnumAudioEndpoints(dataflow, dwstatemask)? },
-        }
-        .into())
+        }))
     }
 
     fn GetDefaultAudioEndpoint(&self, dataflow: EDataFlow, role: ERole) -> WinResult<IMMDevice> {
@@ -528,7 +528,7 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
                     );
                     info_tagged!(tag, "Client created");
                     let info = RedirectClientInfo::new(config, tag.into());
-                    let proxy: IAudioClient3 = match config.mode {
+                    let proxy = match config.mode {
                         ClientMode::Normal => RedirectAudioClient::new(inner, info).into(),
                         ClientMode::Compat => RedirectCompatAudioClient::new(
                             inner,
@@ -1043,7 +1043,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                     };
                     let inner_buffer_len = unsafe { self.inner.GetBufferSize()? };
                     let align = AudioAlign::new(self.align.get());
-                    let service: IAudioRenderClient = RedirectCompatAudioRenderClient {
+                    let service = IAudioRenderClient::from(RedirectCompatAudioRenderClient {
                         inner: unsafe { self.inner.GetService::<IAudioRenderClient>()? },
                         trick_buffer: vec![0; align.frames_to_bytes(inner_buffer_len as usize)]
                             .into_boxed_slice()
@@ -1052,9 +1052,10 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                         align,
                         buffer_len: (inner_buffer_len, hooker_buffer_len),
                         tag: format!("{}-client", self.info.tag).into(),
-                    }
-                    .into();
-                    unsafe { service.query(riid, ppv).ok() }
+                    });
+                    let ret = unsafe { service.query(riid, ppv).ok() };
+                    _ = self.outer.set(service);
+                    ret
                 }
             }
             _ => unsafe {
@@ -1330,6 +1331,7 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
             let outer: &RedirectRingbufAudioRenderClient = unsafe { outer.as_impl() };
             outer.trick.set(false);
             let thread: &RedirectRingbufThread = unsafe { rthread.as_impl() };
+            thread.pause.store(false, Ordering::Relaxed);
             if !thread.init.is_completed() {
                 let result = unsafe { RtwqCreateAsyncResult(None, rthread, None)? };
                 thread.init.call_once(|| {
@@ -1339,7 +1341,6 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                 });
                 unsafe { RtwqPutWorkItem(thread.thread_id, 1, &result)? }
             }
-            thread.pause.store(false, Ordering::Relaxed);
         }
         unsafe { self.inner.Start() }
     }
@@ -1392,18 +1393,17 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                     let mut ids = [0; 2];
                     unsafe { RtwqLockSharedWorkQueue(w!("Audio"), 1, &mut ids[0], &mut ids[1])? };
                     let buf_size = unsafe { self.inner.GetBufferSize()? };
-                    let real_size = self
-                        .info
-                        .config
-                        .target_buf_len(param)
-                        .map_or(buf_size, |len| len.clamp(param.current_period, buf_size));
                     info_tagged!(@self,"Creating thread");
                     let callback = RedirectRingbufThread {
                         buffer: consumer.into(),
                         client: self.inner.clone(),
                         inner: unsafe { self.inner.GetService::<IAudioRenderClient>()? },
                         align,
-                        real_len: real_size,
+                        real_len: self
+                            .info
+                            .config
+                            .target_buf_len(param)
+                            .map_or(buf_size, |len| len.clamp(param.current_period, buf_size)),
                         event: unsafe { Owned::new(event_handle) },
                         app_handle: None.into(),
                         thread_id: ids[1],
@@ -1411,14 +1411,13 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                         pause: false.into(),
                         init: Once::new(),
                     };
-                    let client: IAudioRenderClient = RedirectRingbufAudioRenderClient {
+                    let client = IAudioRenderClient::from(RedirectRingbufAudioRenderClient {
                         buffer: producer.into(),
                         cache: vec![0u8; buffer].into_boxed_slice().into(),
                         align,
                         trick: true.into(),
                         tag: format!("{}-render", self.info.tag).into(),
-                    }
-                    .into();
+                    });
                     let ret = unsafe { client.query(riid, ppv) }.ok();
                     _ = self.outer.set((client, callback.into()));
                     ret
