@@ -268,10 +268,7 @@ unsafe extern "system" fn hooked_cocreateinstance(
                 trace!("Skipping SpecialK CoCreateInstance calls, thread name: {name}");
             } else {
                 debug!("Intercepted IMMDeviceEnumerator creation via CoCreateInstance");
-                *ppv = IMMDeviceEnumerator::from(RedirectDeviceEnumerator::new(
-                    IMMDeviceEnumerator::from_raw(*ppv),
-                ))
-                .into_raw();
+                *ppv = IMMDeviceEnumerator::from(RedirectDeviceEnumerator::new(*ppv)).into_raw();
             }
         }
         ret
@@ -302,11 +299,10 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
                 for qi in from_raw_parts_mut(presults, dwcount as usize) {
                     if *qi.pIID == IMMDeviceEnumerator::IID && qi.hr.is_ok() {
                         debug!("Intercepted IMMDeviceEnumerator via CoCreateInstanceEx");
-                        let proxy_enumerator = IMMDeviceEnumerator::from(
-                            RedirectDeviceEnumerator::new(IMMDeviceEnumerator::from_raw(
+                        let proxy_enumerator =
+                            IMMDeviceEnumerator::from(RedirectDeviceEnumerator::new(
                                 qi.pItf.take().unwrap_unchecked().into_raw(),
-                            )),
-                        );
+                            ));
                         _ = qi.pItf.insert(proxy_enumerator.into())
                     }
                 }
@@ -322,8 +318,10 @@ struct RedirectDeviceEnumerator {
     inner: IMMDeviceEnumerator,
 }
 impl RedirectDeviceEnumerator {
-    pub fn new(inner: IMMDeviceEnumerator) -> Self {
-        Self { inner }
+    pub fn new(inner: *mut c_void) -> Self {
+        Self {
+            inner: unsafe { IMMDeviceEnumerator::from_raw(inner) },
+        }
     }
 }
 impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
