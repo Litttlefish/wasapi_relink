@@ -1,6 +1,7 @@
 // #[cfg(test)]
 // mod config_test;
 
+use core::ffi::c_void;
 use flexi_logger::*;
 use log::*;
 use retour::GenericDetour;
@@ -10,10 +11,12 @@ use std::cell::{Cell, OnceCell, UnsafeCell};
 use std::collections::HashMap;
 use std::mem::transmute;
 use std::num::NonZero;
-use std::os::raw::c_void;
 use std::path::Path;
 use std::slice::from_raw_parts_mut;
 use std::sync::{LazyLock, Once, OnceLock, atomic::*};
+use windows::Win32::System::LibraryLoader::{
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GetModuleHandleExW,
+};
 
 use windows::{
     Win32::{
@@ -1682,6 +1685,15 @@ fn setup() -> LoggerHandle {
         ConfigSource::NoFile => {
             info!("Config file not found, using default values")
         }
+    }
+    unsafe {
+        let mut _discard = HMODULE::default();
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            PCWSTR::from_raw(proxy_dummy as _),
+            &mut _discard,
+        )
+        .ok();
     }
     handle
 }
