@@ -229,23 +229,16 @@ static CO_CREATE: LazyLock<(
     GenericDetour<FnCoCreateInstance>,
     GenericDetour<FnCoCreateInstanceEx>,
 )> = LazyLock::new(|| unsafe {
-    link!("combase.dll" "system" fn CoCreateInstance(_ : *const GUID, _ : *mut c_void, _ : CLSCTX, _ : *const GUID, _ : *mut *mut c_void) -> HRESULT);
-    link!("combase.dll" "system" fn CoCreateInstanceEx(_ : *const GUID, _ : *mut c_void, _ : CLSCTX, _ : *const COSERVERINFO, _ : u32, _ : *mut MULTI_QI) -> HRESULT);
-    let (func, funcex): (FnCoCreateInstance, FnCoCreateInstanceEx) =
-        transmute(GetModuleHandleW(w!("combase")).map_or(
-            {
+    let (func, funcex): (FnCoCreateInstance, FnCoCreateInstanceEx) = transmute(
+        GetModuleHandleW(w!("combase"))
+            .map(|hmodule| {
                 (
-                    CoCreateInstance as *mut c_void,
-                    CoCreateInstanceEx as *mut c_void,
+                    GetProcAddress(hmodule, s!("CoCreateInstance")).unwrap() as *mut c_void,
+                    GetProcAddress(hmodule, s!("CoCreateInstanceEx")).unwrap() as *mut c_void,
                 )
-            },
-            |hmodule| {
-                (
-                    GetProcAddress(hmodule, s!("CoCreateInstance")).unwrap() as *mut _,
-                    GetProcAddress(hmodule, s!("CoCreateInstanceEx")).unwrap() as *mut _,
-                )
-            },
-        ));
+            })
+            .expect("combase.dll not found in process"),
+    );
     (
         GenericDetour::new(func, hooked_cocreateinstance).unwrap(),
         GenericDetour::new(funcex, hooked_cocreateinstanceex).unwrap(),
