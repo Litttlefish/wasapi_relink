@@ -1697,9 +1697,8 @@ extern "C" fn proxy_dummy() {}
 #[unsafe(no_mangle)]
 unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut c_void) -> BOOL {
     match reason {
-        1 => unsafe { CO_CREATE.0.enable().is_ok() && CO_CREATE.1.enable().is_ok() },
-        0 => unsafe { CO_CREATE.0.disable().is_ok() && CO_CREATE.1.disable().is_ok() },
-        _ => true,
+        1 => unsafe { CO_CREATE.0.enable().is_ok() && CO_CREATE.1.enable().is_ok() }.into(),
+        0 => unsafe { CO_CREATE.0.disable().is_ok() && CO_CREATE.1.disable().is_ok() }.into(),
+        _ => TRUE,
     }
-    .into()
 }
