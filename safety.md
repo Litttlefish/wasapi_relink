@@ -6,9 +6,7 @@
 
 ## DllMain安全
 
-DllMain中不应该做的事(个人总结版): 开启/安排任何线程, `LoadLibrary*` 函数加载或用 `GetModuleHandleEx` 中会修改引用计数的参数获取HANDLE,但普通的 `GetModuleHandle` 并不能保证成功
-
-所以我在这里用了 `link!` 宏,将目标函数放入IAT,这样如果 `GetModuleHandle` 不成功,就代表我们大概率是第一个加载 `combase` 的,直接把IAT里的函数地址拿过来替换就行了
+DllMain中不应该做的事(个人总结版): 开启/安排任何线程, `LoadLibrary*` 函数加载或用 `GetModuleHandleEx` 中会修改引用计数的参数获取HANDLE,考虑到这里 `GetModuleHandle` 获取的是 `combase`,这个要是失败了程序估计也就不正常了,不如直接炸掉(
 
 ## 大前提
 
