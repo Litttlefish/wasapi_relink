@@ -5,6 +5,7 @@ use core::ffi::c_void;
 use flexi_logger::*;
 use log::*;
 use retour::GenericDetour;
+use rpmalloc::RpMalloc;
 use rtrb::{Consumer, Producer, RingBuffer};
 use serde::*;
 use std::cell::{Cell, OnceCell, UnsafeCell};
@@ -17,6 +18,9 @@ use std::sync::{LazyLock, Once, OnceLock, atomic::*};
 use windows::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GetModuleHandleExW,
 };
+
+#[global_allocator]
+static GLOBAL: RpMalloc = RpMalloc;
 
 use windows::{
     Win32::{
