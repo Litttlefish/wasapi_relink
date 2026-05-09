@@ -17,7 +17,7 @@ use std::ptr::null_mut;
 use std::slice::from_raw_parts_mut;
 use std::sync::{LazyLock, Once, OnceLock, atomic::*};
 use windows::Win32::System::LibraryLoader::{
-    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GetModuleHandleExW,
+    DisableThreadLibraryCalls, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GetModuleHandleExW,
 };
 
 #[global_allocator]
@@ -1688,7 +1688,7 @@ fn setup() -> LoggerHandle {
 extern "C" fn proxy_dummy() {}
 
 #[unsafe(no_mangle)]
-unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut c_void) -> BOOL {
+unsafe extern "system" fn DllMain(hinstance: HINSTANCE, reason: u32, _: *mut c_void) -> BOOL {
     match reason {
         1 => unsafe {
             let module = GetModuleHandleW(w!("combase")).expect("combase.dll not found in process");
@@ -1708,7 +1708,8 @@ unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut c_void) -> 
                 .unwrap(),
                 Ordering::Relaxed,
             );
-            MinHook::enable_all_hooks().is_ok().into()
+            MinHook::enable_all_hooks().unwrap();
+            DisableThreadLibraryCalls(hinstance.into()).is_ok().into()
         },
         _ => TRUE,
     }
