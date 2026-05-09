@@ -144,7 +144,7 @@ target_period_hus = 20
 target_buffer_len.48000 = 256
 # (通用) 为此流启用原始处理 (bool)。
 raw = true
-# (通用) 在初始化前报告修改后的周期长度。
+# (通用) 在初始化前报告修改后的周期长度(如果程序真的请求了周期的话)。
 force_period = true
 
 [playback]

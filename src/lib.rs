@@ -4,7 +4,7 @@
 use core::ffi::c_void;
 use flexi_logger::*;
 use log::*;
-use retour::GenericDetour;
+use minhook::MinHook;
 use rpmalloc::RpMalloc;
 use rtrb::{Consumer, Producer, RingBuffer};
 use serde::*;
@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::mem::transmute;
 use std::num::NonZero;
 use std::path::Path;
+use std::ptr::null_mut;
 use std::slice::from_raw_parts_mut;
 use std::sync::{LazyLock, Once, OnceLock, atomic::*};
 use windows::Win32::System::LibraryLoader::{
@@ -229,26 +230,7 @@ type FnCoCreateInstanceEx = unsafe extern "system" fn(
 
 const KEYWORDS: &[&str] = &["[GAME]", "[SK]"];
 
-static CO_CREATE: LazyLock<(
-    GenericDetour<FnCoCreateInstance>,
-    GenericDetour<FnCoCreateInstanceEx>,
-)> = LazyLock::new(|| unsafe {
-    let (func, funcex): (FnCoCreateInstance, FnCoCreateInstanceEx) = transmute(
-        GetModuleHandleW(w!("combase"))
-            .map(|hmodule| {
-                (
-                    GetProcAddress(hmodule, s!("CoCreateInstance")).unwrap() as *mut c_void,
-                    GetProcAddress(hmodule, s!("CoCreateInstanceEx")).unwrap() as *mut c_void,
-                )
-            })
-            .expect("combase.dll not found in process"),
-    );
-    (
-        GenericDetour::new(func, hooked_cocreateinstance).unwrap(),
-        GenericDetour::new(funcex, hooked_cocreateinstanceex).unwrap(),
-    )
-});
-
+static COCREATEINSTANCE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 unsafe extern "system" fn hooked_cocreateinstance(
     rclsid: *const GUID,
     punkouter: *mut c_void,
@@ -257,7 +239,13 @@ unsafe extern "system" fn hooked_cocreateinstance(
     ppv: *mut *mut c_void,
 ) -> HRESULT {
     unsafe {
-        let ret = CO_CREATE.0.call(rclsid, punkouter, dwclscontext, riid, ppv);
+        let ret = transmute::<*mut _, FnCoCreateInstance>(COCREATEINSTANCE.load(Ordering::Relaxed))(
+            rclsid,
+            punkouter,
+            dwclscontext,
+            riid,
+            ppv,
+        );
         if *riid == IMMDeviceEnumerator::IID && ret.is_ok() {
             LOGGER_HANDLE.get_or_init(setup);
             if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
@@ -275,6 +263,7 @@ unsafe extern "system" fn hooked_cocreateinstance(
     }
 }
 
+static COCREATEINSTANCEEX: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 unsafe extern "system" fn hooked_cocreateinstanceex(
     clsid: *const GUID,
     punkouter: *mut c_void,
@@ -284,9 +273,9 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
     presults: *mut MULTI_QI,
 ) -> HRESULT {
     unsafe {
-        let hr = CO_CREATE
-            .1
-            .call(clsid, punkouter, dwclsctx, pserverinfo, dwcount, presults);
+        let hr = transmute::<*mut _, FnCoCreateInstanceEx>(
+            COCREATEINSTANCEEX.load(Ordering::Relaxed),
+        )(clsid, punkouter, dwclsctx, pserverinfo, dwcount, presults);
         if *clsid == MMDeviceEnumerator && hr.is_ok() {
             LOGGER_HANDLE.get_or_init(setup);
             if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
@@ -1701,8 +1690,26 @@ extern "C" fn proxy_dummy() {}
 #[unsafe(no_mangle)]
 unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut c_void) -> BOOL {
     match reason {
-        1 => unsafe { CO_CREATE.0.enable().is_ok() && CO_CREATE.1.enable().is_ok() }.into(),
-        0 => unsafe { CO_CREATE.0.disable().is_ok() && CO_CREATE.1.disable().is_ok() }.into(),
+        1 => unsafe {
+            let module = GetModuleHandleW(w!("combase")).expect("combase.dll not found in process");
+            COCREATEINSTANCE.store(
+                MinHook::create_hook(
+                    GetProcAddress(module, s!("CoCreateInstance")).unwrap_unchecked() as _,
+                    hooked_cocreateinstance as _,
+                )
+                .unwrap(),
+                Ordering::Relaxed,
+            );
+            COCREATEINSTANCEEX.store(
+                MinHook::create_hook(
+                    GetProcAddress(module, s!("CoCreateInstanceEx")).unwrap_unchecked() as _,
+                    hooked_cocreateinstanceex as _,
+                )
+                .unwrap(),
+                Ordering::Relaxed,
+            );
+            MinHook::enable_all_hooks().is_ok().into()
+        },
         _ => TRUE,
     }
 }

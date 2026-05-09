@@ -144,7 +144,7 @@ target_period_hus = 20
 target_buffer_len.48000 = 256
 # (General) Enable raw process for this stream (bool).
 raw = true
-# (General) Report spoofed period before client initialize.
+# (General) Report spoofed period before client initialize(if any).
 force_period = true
 
 [playback]
