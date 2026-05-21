@@ -13,12 +13,8 @@ use std::collections::HashMap;
 use std::mem::transmute;
 use std::num::NonZero;
 use std::path::Path;
-use std::ptr::null_mut;
 use std::slice::from_raw_parts_mut;
 use std::sync::{LazyLock, Once, OnceLock, atomic::*};
-use windows::Win32::System::LibraryLoader::{
-    DisableThreadLibraryCalls, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GetModuleHandleExW,
-};
 
 #[global_allocator]
 static GLOBAL: RpMalloc = RpMalloc;
@@ -28,7 +24,7 @@ use windows::{
         Foundation::*,
         Media::Audio::*,
         System::Com::{StructuredStorage::*, *},
-        System::LibraryLoader::{GetModuleHandleW, GetProcAddress},
+        System::LibraryLoader::*,
         System::Threading::*,
         UI::Shell::PropertiesSystem::IPropertyStore,
     },
@@ -36,6 +32,13 @@ use windows::{
 };
 
 static LOGGER_HANDLE: OnceLock<LoggerHandle> = OnceLock::new();
+
+const PROPERTY: AudioClientProperties = const {
+    let mut prop: AudioClientProperties = unsafe { std::mem::zeroed() };
+    prop.cbSize = size_of::<AudioClientProperties>() as u32;
+    prop.Options = AUDCLNT_STREAMOPTIONS_RAW;
+    prop
+};
 
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
 enum ConfigLogLevel {
@@ -211,26 +214,17 @@ static CONFIG: LazyLock<RedirectConfig> = LazyLock::new(RedirectConfig::load);
 
 static CLIENT_ID: (AtomicU16, AtomicU16) = (AtomicU16::new(0), AtomicU16::new(0));
 
-type FnCoCreateInstance = unsafe extern "system" fn(
-    *const GUID,
-    *mut c_void,
-    CLSCTX,
-    *const GUID,
-    *mut *mut c_void,
-) -> HRESULT;
-
-type FnCoCreateInstanceEx = unsafe extern "system" fn(
-    *const GUID,
-    *mut c_void,
-    CLSCTX,
-    *const COSERVERINFO,
-    u32,
-    *mut MULTI_QI,
-) -> HRESULT;
-
 const KEYWORDS: &[&str] = &["[GAME]", "[SK]"];
 
-static COCREATEINSTANCE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+static mut COCREATEINSTANCE: Option<
+    unsafe extern "system" fn(
+        *const GUID,
+        *mut c_void,
+        CLSCTX,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> HRESULT,
+> = None;
 unsafe extern "system" fn hooked_cocreateinstance(
     rclsid: *const GUID,
     punkouter: *mut c_void,
@@ -239,13 +233,7 @@ unsafe extern "system" fn hooked_cocreateinstance(
     ppv: *mut *mut c_void,
 ) -> HRESULT {
     unsafe {
-        let ret = transmute::<*mut _, FnCoCreateInstance>(COCREATEINSTANCE.load(Ordering::Relaxed))(
-            rclsid,
-            punkouter,
-            dwclscontext,
-            riid,
-            ppv,
-        );
+        let ret = COCREATEINSTANCE.unwrap_unchecked()(rclsid, punkouter, dwclscontext, riid, ppv);
         if *riid == IMMDeviceEnumerator::IID && ret.is_ok() {
             LOGGER_HANDLE.get_or_init(setup);
             if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
@@ -263,7 +251,16 @@ unsafe extern "system" fn hooked_cocreateinstance(
     }
 }
 
-static COCREATEINSTANCEEX: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+static mut COCREATEINSTANCEEX: Option<
+    unsafe extern "system" fn(
+        *const GUID,
+        *mut c_void,
+        CLSCTX,
+        *const COSERVERINFO,
+        u32,
+        *mut MULTI_QI,
+    ) -> HRESULT,
+> = None;
 unsafe extern "system" fn hooked_cocreateinstanceex(
     clsid: *const GUID,
     punkouter: *mut c_void,
@@ -273,9 +270,14 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
     presults: *mut MULTI_QI,
 ) -> HRESULT {
     unsafe {
-        let hr = transmute::<*mut _, FnCoCreateInstanceEx>(
-            COCREATEINSTANCEEX.load(Ordering::Relaxed),
-        )(clsid, punkouter, dwclsctx, pserverinfo, dwcount, presults);
+        let hr = COCREATEINSTANCEEX.unwrap_unchecked()(
+            clsid,
+            punkouter,
+            dwclsctx,
+            pserverinfo,
+            dwcount,
+            presults,
+        );
         if *clsid == MMDeviceEnumerator && hr.is_ok() {
             LOGGER_HANDLE.get_or_init(setup);
             if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
@@ -303,14 +305,10 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
 
 #[repr(transparent)]
 #[implement(IMMDeviceEnumerator)]
-struct RedirectDeviceEnumerator {
-    inner: IMMDeviceEnumerator,
-}
+struct RedirectDeviceEnumerator(IMMDeviceEnumerator);
 impl RedirectDeviceEnumerator {
-    pub fn new(inner: *mut c_void) -> Self {
-        Self {
-            inner: unsafe { IMMDeviceEnumerator::from_raw(inner) },
-        }
+    fn new(inner: *mut c_void) -> Self {
+        Self(unsafe { IMMDeviceEnumerator::from_raw(inner) })
     }
 }
 impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
@@ -323,9 +321,9 @@ impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
             "DeviceEnumerator::EnumAudioEndpoints requested on flow {}",
             dataflow.0
         );
-        Ok(IMMDeviceCollection::from(RedirectDeviceCollection {
-            inner: unsafe { self.inner.EnumAudioEndpoints(dataflow, dwstatemask)? },
-        }))
+        Ok(IMMDeviceCollection::from(RedirectDeviceCollection(
+            unsafe { self.0.EnumAudioEndpoints(dataflow, dwstatemask)? },
+        )))
     }
 
     fn GetDefaultAudioEndpoint(&self, dataflow: EDataFlow, role: ERole) -> WinResult<IMMDevice> {
@@ -333,15 +331,12 @@ impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
             "DeviceEnumerator::GetDefaultAudioEndpoint requested on flow {}",
             dataflow.0
         );
-        Ok(
-            RedirectDevice::new(unsafe { self.inner.GetDefaultAudioEndpoint(dataflow, role)? })
-                .into(),
-        )
+        Ok(RedirectDevice::new(unsafe { self.0.GetDefaultAudioEndpoint(dataflow, role)? }).into())
     }
 
     fn GetDevice(&self, pwstrid: &PCWSTR) -> WinResult<IMMDevice> {
         info!("DeviceEnumerator::GetDevice called, wrapping");
-        Ok(RedirectDevice::new(unsafe { self.inner.GetDevice(*pwstrid)? }).into())
+        Ok(RedirectDevice::new(unsafe { self.0.GetDevice(*pwstrid)? }).into())
     }
 
     fn RegisterEndpointNotificationCallback(
@@ -350,7 +345,7 @@ impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
     ) -> WinResult<()> {
         trace!("DeviceEnumerator::RegisterEndpointNotificationCallback called");
         unsafe {
-            self.inner
+            self.0
                 .RegisterEndpointNotificationCallback(pclient.as_ref())
         }
     }
@@ -361,7 +356,7 @@ impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
     ) -> WinResult<()> {
         trace!("DeviceEnumerator::UnregisterEndpointNotificationCallback called");
         unsafe {
-            self.inner
+            self.0
                 .UnregisterEndpointNotificationCallback(pclient.as_ref())
         }
     }
@@ -369,18 +364,16 @@ impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
 
 #[repr(transparent)]
 #[implement(IMMDeviceCollection)]
-struct RedirectDeviceCollection {
-    inner: IMMDeviceCollection,
-}
+struct RedirectDeviceCollection(IMMDeviceCollection);
 impl IMMDeviceCollection_Impl for RedirectDeviceCollection_Impl {
     fn GetCount(&self) -> WinResult<u32> {
         trace!("DeviceCollection::GetCount called");
-        unsafe { self.inner.GetCount() }
+        unsafe { self.0.GetCount() }
     }
 
     fn Item(&self, ndevice: u32) -> WinResult<IMMDevice> {
         debug!("DeviceCollection::Item retrieved device {ndevice}");
-        Ok(RedirectDevice::new(unsafe { self.inner.Item(ndevice)? }).into())
+        Ok(RedirectDevice::new(unsafe { self.0.Item(ndevice)? }).into())
     }
 }
 
@@ -609,10 +602,12 @@ impl std::fmt::Display for DeviceDataFlow {
     }
 }
 
+#[inline]
 const fn calculate_buffer(sample_rate: u32, fundamental: u32, target: u32) -> u32 {
     sample_rate * target / 10000 / fundamental * fundamental
 }
 
+#[inline]
 const fn calculate_period(sample_rate: u32, buffer_len: u32) -> i64 {
     (buffer_len * 100000 / (sample_rate / 100)) as i64
 }
@@ -852,12 +847,7 @@ impl IAudioClient3_Impl for RedirectAudioClient_Impl {
         unsafe {
             if self.info.config.raw && !self.info.raw_flag.is_completed() {
                 info_tagged!(@self, "Applying raw flag");
-                let properties = AudioClientProperties {
-                    cbSize: size_of::<AudioClientProperties>() as u32,
-                    Options: AUDCLNT_STREAMOPTIONS_RAW,
-                    ..AudioClientProperties::default()
-                };
-                self.inner.SetClientProperties(&properties)?;
+                self.inner.SetClientProperties(&PROPERTY)?;
             }
             self.inner.InitializeSharedAudioStream(
                 streamflags,
@@ -1087,19 +1077,14 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
     ) -> WinResult<()> {
         if self.info.config.raw && !self.info.raw_flag.is_completed() {
             info_tagged!(@self, "Applying raw flag");
-            let properties = AudioClientProperties {
-                cbSize: size_of::<AudioClientProperties>() as u32,
-                Options: AUDCLNT_STREAMOPTIONS_RAW,
-                ..AudioClientProperties::default()
-            };
-            unsafe { self.inner.SetClientProperties(&properties) }?;
+            unsafe { self.inner.SetClientProperties(&PROPERTY) }?;
         }
         self.align.set(unsafe { (*pformat).nBlockAlign });
         self.info.initialized.set(true);
         let client = if periodinframes != 0 {
-            warn_tagged!(
+            info_tagged!(
                 @self,
-                "InitializeSharedAudioStream called, you shouldn't use this mode! original period: {periodinframes}"
+                "InitializeSharedAudioStream -> clamping prefill, original period: {periodinframes}"
             );
             &self.inner
         } else {
@@ -1132,7 +1117,7 @@ impl RedirectCompatAudioRenderClient {
         let read_len = self.align.frames_to_bytes(len as usize);
         unsafe {
             let slice_to_write = from_raw_parts_mut(self.inner.GetBuffer(len)?, read_len);
-            let slice = &(&*self.trick_buffer.get())[..read_len];
+            let slice = &self.trick_buffer.get().as_ref_unchecked()[..read_len];
             slice_to_write.copy_from_slice(slice);
             self.inner.ReleaseBuffer(len, dwflags)
         }
@@ -1300,7 +1285,7 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
         trace_tagged!(@self, "GetCurrentPadding called");
         if let Some((outer, _)) = self.outer.get() {
             let outer: &RedirectRingbufAudioRenderClient = unsafe { outer.as_impl() };
-            let buf = unsafe { &*outer.buffer.get() };
+            let buf = unsafe { outer.buffer.get().as_ref_unchecked() };
             let len = self.buffer.get();
             Ok(if buf.is_full() {
                 len
@@ -1461,12 +1446,7 @@ impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
             let target_config = self.info.config;
             if target_config.raw && !self.info.raw_flag.is_completed() {
                 info_tagged!(@self, "Applying raw flag");
-                let properties = AudioClientProperties {
-                    cbSize: size_of::<AudioClientProperties>() as u32,
-                    Options: AUDCLNT_STREAMOPTIONS_RAW,
-                    ..AudioClientProperties::default()
-                };
-                self.inner.SetClientProperties(&properties)?;
+                self.inner.SetClientProperties(&PROPERTY)?;
             }
             let param = self.info.param(&self.inner)?;
             self.set_buffer(param);
@@ -1508,7 +1488,7 @@ impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
         Ok(())
     }
     fn Invoke(&self, pasyncresult: Ref<IRtwqAsyncResult>) -> WinResult<()> {
-        let buffer = unsafe { &mut *self.buffer.get() };
+        let buffer = unsafe { self.buffer.get().as_mut_unchecked() };
         if buffer.is_abandoned() {
             return Ok(());
         } else {
@@ -1580,7 +1560,7 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
                 "GetBuffer called, requested: {numframesrequested}"
             );
         }
-        Ok(unsafe { &mut *self.cache.get() }.as_mut_ptr())
+        Ok(unsafe { self.cache.get().as_mut_unchecked() }.as_mut_ptr())
     }
     fn ReleaseBuffer(&self, numframeswritten: u32, dwflags: u32) -> WinResult<()> {
         if numframeswritten == 0 {
@@ -1597,8 +1577,8 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
             }
         }
         unsafe {
-            let buffer = &mut *self.buffer.get();
-            let slice = &mut (&mut *self.cache.get())
+            let buffer = self.buffer.get().as_mut_unchecked();
+            let slice = &mut self.cache.get().as_mut_unchecked()
                 [..(self.align.frames_to_bytes(numframeswritten as usize))];
             if dwflags == 2 {
                 slice.fill(0);
@@ -1692,22 +1672,18 @@ unsafe extern "system" fn DllMain(hinstance: HINSTANCE, reason: u32, _: *mut c_v
     match reason {
         1 => unsafe {
             let module = GetModuleHandleW(w!("combase")).expect("combase.dll not found in process");
-            COCREATEINSTANCE.store(
-                MinHook::create_hook(
-                    GetProcAddress(module, s!("CoCreateInstance")).unwrap_unchecked() as _,
-                    hooked_cocreateinstance as _,
-                )
-                .unwrap(),
-                Ordering::Relaxed,
-            );
-            COCREATEINSTANCEEX.store(
-                MinHook::create_hook(
-                    GetProcAddress(module, s!("CoCreateInstanceEx")).unwrap_unchecked() as _,
-                    hooked_cocreateinstanceex as _,
-                )
-                .unwrap(),
-                Ordering::Relaxed,
-            );
+            COCREATEINSTANCE = MinHook::create_hook(
+                GetProcAddress(module, s!("CoCreateInstance")).unwrap_unchecked() as _,
+                hooked_cocreateinstance as _,
+            )
+            .map(|p| transmute(p))
+            .ok();
+            COCREATEINSTANCEEX = MinHook::create_hook(
+                GetProcAddress(module, s!("CoCreateInstanceEx")).unwrap_unchecked() as _,
+                hooked_cocreateinstanceex as _,
+            )
+            .map(|p| transmute(p))
+            .ok();
             MinHook::enable_all_hooks().unwrap();
             DisableThreadLibraryCalls(hinstance.into()).is_ok().into()
         },
