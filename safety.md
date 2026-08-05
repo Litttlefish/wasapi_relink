@@ -24,9 +24,9 @@ compat和ringbuf中,尤其是ringbuf里对异步线程强行使用了as_impl,这
 
 对于生产端已知如下前提:
 
-线程需要先调用GetPadding确认写入量,然后才能Get/Release,这两个操作一个在IAudioClient(as_impl强行读取地方),一个在IAudioRenderClient(也就是生产端实际在的地方),显然这个操作有明确顺序要求,且限制了单线程,所以是安全的
+线程需要先调用GetPadding确认写入量,然后才能Get/Release,这两个操作一个在IAudioClient(as_impl强行读取的地方),一个在IAudioRenderClient(也就是生产端实际在的地方),显然这个操作有明确顺序要求,且限制了单线程,所以是安全的
 
-对于消费端,由于开头需要先检查生产端是否drop,这一步需要解引用,所以常规意义的UB不可避(悲)
+对于消费端,由于开头需要先检查生产端是否drop,这一步需要读取,所以常规意义的UB不可避(悲)
 
 但还是有以下前提可以认为此处的UB基本安全:
 
@@ -36,7 +36,7 @@ compat和ringbuf中,尤其是ringbuf里对异步线程强行使用了as_impl,这
 
 所以在Stop调用时,实际发生的事情如下:
 
-先写一个pause(可以认为瞬间完成),它是原子的,所以这个操作本身安全
+先写一个pause,它是原子的,所以这个操作本身安全
 
 此时线程有两种可能情况:
 

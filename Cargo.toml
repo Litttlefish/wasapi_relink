@@ -1,6 +1,6 @@
 [package]
 name = "wasapi_relink"
-version = "0.14.1"
+version = "0.14.2"
 edition = "2024"
 
 [dependencies]
@@ -24,7 +24,8 @@ toml = "1.*"
 # ringbuf = "0.*"
 rtrb = "0.3.*"
 rpmalloc = "0.2.*"
-minhook = "0.*"
+neohook = "0.13.*"
+likely_stable = "0.1.*"
 # mimalloc = { version = "*", features = ["v3"] }
 # uuid = { version = "1.20.0", features = ["v4"] }
 # min_hook_rs = "2.*"
@@ -44,5 +45,5 @@ crate-type = ["cdylib"]
 [profile.release]
 opt-level = 3
 lto = true
-strip = "debuginfo"
+strip = "symbols"
 panic = "abort"

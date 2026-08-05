@@ -4,7 +4,6 @@
 use core::ffi::c_void;
 use flexi_logger::*;
 use log::*;
-use minhook::MinHook;
 use rpmalloc::RpMalloc;
 use rtrb::{Consumer, Producer, RingBuffer};
 use serde::*;
@@ -165,7 +164,6 @@ enum AudioAlign {
     Normal(usize),
 }
 impl AudioAlign {
-    #[inline(always)]
     fn new(align: u16) -> Self {
         if align.is_power_of_two() {
             Self::Pow2(align.trailing_zeros() as usize)
@@ -602,12 +600,10 @@ impl std::fmt::Display for DeviceDataFlow {
     }
 }
 
-#[inline]
 const fn calculate_buffer(sample_rate: u32, fundamental: u32, target: u32) -> u32 {
     sample_rate * target / 10000 / fundamental * fundamental
 }
 
-#[inline]
 const fn calculate_period(sample_rate: u32, buffer_len: u32) -> i64 {
     (buffer_len * 100000 / (sample_rate / 100)) as i64
 }
@@ -1112,7 +1108,7 @@ struct RedirectCompatAudioRenderClient {
     tag: Box<str>,
 }
 impl RedirectCompatAudioRenderClient {
-    #[inline]
+    #[inline(always)]
     fn apply_data(&self, len: u32, dwflags: u32) -> WinResult<()> {
         let read_len = self.align.frames_to_bytes(len as usize);
         unsafe {
@@ -1142,7 +1138,7 @@ impl IAudioRenderClient_Impl for RedirectCompatAudioRenderClient_Impl {
                 self.tag,
                 "ReleaseBuffer called, written: {numframeswritten}"
             );
-            if dwflags == 2 {
+            return if dwflags == 2 {
                 if numframeswritten == self.buffer_len.0 {
                     info_tagged!(
                         self.tag,
@@ -1156,16 +1152,9 @@ impl IAudioRenderClient_Impl for RedirectCompatAudioRenderClient_Impl {
                 }
             } else {
                 self.apply_data(numframeswritten, dwflags)
-            }
-        } else {
-            if numframeswritten == 0 {
-                warn_tagged!(
-                    self.tag,
-                    "no data written in this release call, overflow may happen!"
-                );
-            }
-            unsafe { self.inner.ReleaseBuffer(numframeswritten, dwflags) }
+            };
         }
+        unsafe { self.inner.ReleaseBuffer(numframeswritten, dwflags) }
     }
 }
 
@@ -1489,7 +1478,7 @@ impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
     }
     fn Invoke(&self, pasyncresult: Ref<IRtwqAsyncResult>) -> WinResult<()> {
         let buffer = unsafe { self.buffer.get().as_mut_unchecked() };
-        if buffer.is_abandoned() {
+        if likely_stable::unlikely(buffer.is_abandoned()) {
             return Ok(());
         } else {
             unsafe { RtwqPutWaitingWorkItem(*self.event, 1, pasyncresult.as_ref(), None)? }
@@ -1580,7 +1569,7 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
             let buffer = self.buffer.get().as_mut_unchecked();
             let slice = &mut self.cache.get().as_mut_unchecked()
                 [..(self.align.frames_to_bytes(numframeswritten as usize))];
-            if dwflags == 2 {
+            if likely_stable::unlikely(dwflags == 2) {
                 slice.fill(0);
             }
             buffer
@@ -1671,20 +1660,24 @@ extern "C" fn proxy_dummy() {}
 unsafe extern "system" fn DllMain(hinstance: HINSTANCE, reason: u32, _: *mut c_void) -> BOOL {
     match reason {
         1 => unsafe {
+            let mut session = neohook::DetourTransaction::begin();
+            session.update_all_threads();
             let module = GetModuleHandleW(w!("combase")).expect("combase.dll not found in process");
-            COCREATEINSTANCE = MinHook::create_hook(
-                GetProcAddress(module, s!("CoCreateInstance")).unwrap_unchecked() as _,
-                hooked_cocreateinstance as _,
-            )
-            .map(|p| transmute(p))
-            .ok();
-            COCREATEINSTANCEEX = MinHook::create_hook(
-                GetProcAddress(module, s!("CoCreateInstanceEx")).unwrap_unchecked() as _,
-                hooked_cocreateinstanceex as _,
-            )
-            .map(|p| transmute(p))
-            .ok();
-            MinHook::enable_all_hooks().unwrap();
+            COCREATEINSTANCE = session
+                .attach(
+                    GetProcAddress(module, s!("CoCreateInstance")).unwrap_unchecked() as _,
+                    hooked_cocreateinstance as _,
+                )
+                .map(|p| transmute(p))
+                .ok();
+            COCREATEINSTANCEEX = session
+                .attach(
+                    GetProcAddress(module, s!("CoCreateInstanceEx")).unwrap_unchecked() as _,
+                    hooked_cocreateinstanceex as _,
+                )
+                .map(|p| transmute(p))
+                .ok();
+            core::mem::forget(session.commit().expect("transaction failed"));
             DisableThreadLibraryCalls(hinstance.into()).is_ok().into()
         },
         _ => TRUE,
