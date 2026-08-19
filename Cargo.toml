@@ -22,7 +22,7 @@ flexi_logger = { version = "0.31.*", features = ["async"] }
 serde = { version = "1.*", features = ["derive"] }
 toml = "1.*"
 # ringbuf = "0.*"
-rtrb = "0.3.*"
+rtrb = "0.4.*"
 rpmalloc = "0.2.*"
 neohook = "0.13.*"
 likely_stable = "0.1.*"
