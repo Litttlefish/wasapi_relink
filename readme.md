@@ -20,11 +20,11 @@ Your audio driver reports a supported buffer range (i.e. `GetSharedModeEnginePer
 
 Most stock Realtek audio drivers (the ones from the manufacturer) lock the buffer range to 10ms *exact*.
 
-If your driver does this, wasapi_relink will have no effect, as it cannot request a buffer smaller than 10ms.
+If your driver does this, wasapi_relink will have *no effect*, as it cannot request a buffer smaller than 10ms.
 
 #### The Solution
 
-You must replace the Realtek driver with Windows generic "High Definition Audio Device" driver. This standard Microsoft driver typically allows a 2ms-10ms range, enabling `wasapi_relink` to successfully request a 2ms buffer.
+You must replace the Realtek driver with Windows generic **"High Definition Audio Device"** driver. This standard Microsoft driver typically allows a 2ms-10ms range, enabling `wasapi_relink` to successfully request a 2ms buffer.
 
 Or, use a professional soundcard or external audio interface that supports low-latency.
 
@@ -75,7 +75,7 @@ P.S.: Currently, there don't seem to be many sound cards that are compatible wit
 
 **Method:**
 
-1. Intercepts `Initialize` / `InitializeSharedAudioStream` and always calls `InitializeSharedAudioStream` with the tool’s low‑latency period.
+1. Intercepts `Initialize` / `InitializeSharedAudioStream` and always calls `InitializeSharedAudioStream` with the configurated period.
 
 2. Creates an internal ring buffer whose capacity is exposed to the app as the reported `IAudioClient::GetBufferSize`, and `IAudioClient::GetCurrentPadding` reports how much data is in the ring buffer, not the real engine buffer. The app feels like it’s writing into a large, traditional buffer, while the engine actually runs at the small period.
 
@@ -140,9 +140,9 @@ only_log_stdout = false
 # e.g., 20 = 2.0ms.
 target_period_hus = 20
 # (General) Target buffer length (in audio frames) reported to the corresponding samplerate.
-# The number will be automatically rounded UP to align with the driver's fundamental period for optimal performance while clamped within range.
+# The number will be automatically rounded UP to align with the driver's fundamental period for optimal performance while clamped within system allocated buffer length.
 target_buffer_len.48000 = 256
-# (General) Enable raw process for this stream (bool).
+# (General) Enable raw processing for this stream (bool).
 raw = true
 # (General) Report spoofed period before client initialize(if any).
 force_period = true
@@ -159,7 +159,7 @@ ring_buffer_len.48000 = 340 # about 7ms buffer
 # (Compat mode exclusive, Optional) Assign a shared stream buffer duration (in 100-nanosecond units) to the corresponding samplerate.
 # The number will be directly used as the inner shared buffer, and will be clamped by Windows if set too low.
 compat_buffer_dur_hns.48000 = 0 # this will clamp to minimum allowed value
-compat_buffer_dur_hns.96000 = 238350
+compat_buffer_dur_hns.96000 = 238350 # only works in 96khz
 
 
 ```
@@ -236,7 +236,7 @@ Use this guide to diagnose and fix common audio issues.
 
 ```toml
 [playback]
-compat_buffer_dur_hns.48000 = 238350
+compat_buffer_dur_hns.48000 = 127500
 compat_buffer_dur_hns.96000 = 250000  # Add a specific value for 96kHz
 ```
 
@@ -290,7 +290,7 @@ Previous tools([REAL](https://github.com/miniant-git/REAL), [LowAudioLatency](ht
 
 - **What they missed (The "Myth"):** They assumed lowering the hardware buffer was enough. **It isn't.** A poll-driven application will *still* try to **prefill** its old 10ms buffer. The latency bottleneck just moves from the hardware to the application's own prefill.
 
- `wasapi_relink`'s **Compat Mode** solves *both* problems: it triggers the hardware change and internally hooks the application to *deceive and modify its prefill* to match the new, smaller hardware buffer.
+`wasapi_relink`'s **Compat Mode** solves *both* problems: it triggers the hardware change and internally hooks the application to *deceive and modify its prefill* to match the new, smaller hardware buffer.
 
 ### The Size Mismatch: Why Ringbuf Mode Exists
 
@@ -306,7 +306,7 @@ Games, however, do not think in 128-frame chunks:
 
 - Rhythm Games / Fixed-block mixers: They mix audio in large, rigid chunks (e.g., 256, 512, or 1024 frames) dictated by their internal logic frame.
 
-- Poll-driven Engines (Unity, etc.): They operate in a tight while loop, calling `GetCurrentPadding` with fixed duration to see if *any* space is available, then dumping whatever they have.
+- Poll-driven Engines (Unity, etc.): They operate in a tight loop with sleeps, calling `GetCurrentPadding` with fixed duration to see if *any* space is available, then dumping whatever they have.
 
 **The Direct Consequence:**
 

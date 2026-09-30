@@ -537,7 +537,7 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
                         },
                         ClientMode::Bypass => inner,
                     };
-                    proxy.query(riid, ppinterface).ok()
+                    proxy.query(riid, ppinterface)
                 }
                 _ => (self.inner.vtable().Activate)(
                     self.inner.as_raw(),
@@ -546,8 +546,7 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
                     pactivationparams,
                     ppinterface,
                 )
-                .ok(),
-            }
+            }.ok()
         }
     }
 
@@ -846,7 +845,7 @@ impl IAudioClient3_Impl for RedirectAudioClient_Impl {
                 self.inner.SetClientProperties(&PROPERTY)?;
             }
             self.inner.InitializeSharedAudioStream(
-                streamflags,
+                streamflags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                 self.info.param(&self.inner)?.current_period,
                 pformat,
                 Some(audiosessionguid),
@@ -1077,18 +1076,17 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
         }
         self.align.set(unsafe { (*pformat).nBlockAlign });
         self.info.initialized.set(true);
-        let client = if periodinframes != 0 {
-            info_tagged!(
-                @self,
-                "InitializeSharedAudioStream -> clamping prefill, original period: {periodinframes}"
-            );
-            &self.inner
-        } else {
-            &self.hooker
-        };
         unsafe {
-            client.InitializeSharedAudioStream(
-                streamflags,
+            if periodinframes != 0 {
+                info_tagged!(
+                    @self,
+                    "InitializeSharedAudioStream -> clamping prefill, original period: {periodinframes}"
+                );
+                &self.inner
+            } else {
+                &self.hooker
+            }.InitializeSharedAudioStream(
+                streamflags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                 self.info.param(&self.inner)?.current_period,
                 pformat,
                 Some(audiosessionguid),
@@ -1126,7 +1124,7 @@ impl IAudioRenderClient_Impl for RedirectCompatAudioRenderClient_Impl {
                 self.tag,
                 "GetBuffer called, requested: {numframesrequested}"
             );
-            Ok(unsafe { *self.trick_buffer.get().cast() })
+            Ok(unsafe { self.trick_buffer.get().as_mut_unchecked().as_mut_ptr() })
         } else {
             unsafe { self.inner.GetBuffer(numframesrequested) }
         }
@@ -1292,14 +1290,14 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
             let outer: &RedirectRingbufAudioRenderClient = unsafe { outer.as_impl() };
             outer.trick.set(false);
             let thread: &RedirectRingbufThread = unsafe { rthread.as_impl() };
-            thread.pause.store(false, Ordering::Relaxed);
+            thread.pause.store(0, Ordering::Relaxed);
             if !thread.init.is_completed() {
-                let result = unsafe { RtwqCreateAsyncResult(None, rthread, None)? };
                 thread.init.call_once(|| {
                     thread.app_handle.set(
                         (!self.app_handle.get().is_invalid()).then_some(self.app_handle.get()),
                     );
                 });
+                let result = unsafe { RtwqCreateAsyncResult(None, rthread, None)? };
                 unsafe { RtwqPutWorkItem(thread.thread_id, 1, &result)? }
             }
         }
@@ -1310,7 +1308,10 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
         info_tagged!(@self, "Stop called");
         if let Some((_, thread)) = self.outer.get() {
             let thread: &RedirectRingbufThread = unsafe { thread.as_impl() };
-            thread.pause.store(true, Ordering::Relaxed);
+            thread.pause.store(2, Ordering::Relaxed);
+            while thread.pause.load(Ordering::Relaxed) == 2 {
+                std::hint::spin_loop();
+            }
         }
         unsafe { self.inner.Stop() }
     }
@@ -1319,8 +1320,8 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
         info_tagged!(@self, "Reset called");
         if let Some((outer, thread)) = self.outer.get() {
             let thread: &RedirectRingbufThread = unsafe { thread.as_impl() };
-            while unsafe { &mut *thread.buffer.get() }.pop().is_ok() {}
             let outer: &RedirectRingbufAudioRenderClient = unsafe { outer.as_impl() };
+            _ = unsafe { (&mut *thread.buffer.get()).pop_partial_slice(&mut *outer.cache.get()) };
             outer.trick.set(true);
         }
         unsafe { self.inner.Reset() }
@@ -1369,7 +1370,7 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                         app_handle: None.into(),
                         thread_id: ids[1],
                         tag: format!("{}-thread", self.info.tag).into(),
-                        pause: false.into(),
+                        pause: 0.into(),
                         init: Once::new(),
                     };
                     let client = IAudioRenderClient::from(RedirectRingbufAudioRenderClient {
@@ -1419,7 +1420,7 @@ impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
     impl_boilerplate!(IAudioClient3);
     fn InitializeSharedAudioStream(
         &self,
-        mut streamflags: u32,
+        streamflags: u32,
         periodinframes: u32,
         pformat: *const WAVEFORMATEX,
         audiosessionguid: *const GUID,
@@ -1440,14 +1441,9 @@ impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
             let param = self.info.param(&self.inner)?;
             self.set_buffer(param);
             self.align.set(AudioAlign::new((*pformat).nBlockAlign));
-            if streamflags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK == 0 {
-                info_tagged!(@self, "Injecting event flag");
-                streamflags |= AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-            } else {
-                info_tagged!(@self, "Enabling inverse mode");
-            }
+            info_tagged!(@self, "{}", if streamflags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK == 0 {"Injecting event flag"} else {"Enabling inverse mode"});
             self.inner.InitializeSharedAudioStream(
-                streamflags,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                 param.current_period,
                 pformat,
                 Some(audiosessionguid),
@@ -1468,7 +1464,7 @@ struct RedirectRingbufThread {
     app_handle: Cell<Option<HANDLE>>,
     thread_id: u32,
     tag: Box<str>,
-    pause: AtomicBool,
+    pause: AtomicU8,
     init: Once,
 }
 impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
@@ -1482,8 +1478,13 @@ impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
             return Ok(());
         } else {
             unsafe { RtwqPutWaitingWorkItem(*self.event, 1, pasyncresult.as_ref(), None)? }
-            if self.pause.load(Ordering::Relaxed) {
-                return Ok(());
+            match self.pause.load(Ordering::Relaxed) {
+                1 => return Ok(()),
+                2 => {
+                    self.pause.store(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                _ => (),
             }
         }
         if buffer.is_empty() {
@@ -1505,7 +1506,7 @@ impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
             };
             buffer
                 .pop_entire_slice(slice)
-                .unwrap_or_else(|e| warn_tagged!(self.tag, "pop overflow! {e}"));
+                .unwrap_or_else(|e| error_tagged!(self.tag, "pop underflow! {e}"));
             unsafe { self.inner.ReleaseBuffer(write_len as u32, 0)? };
             trace_tagged!(
                 self.tag,
@@ -1518,11 +1519,8 @@ impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
 impl Drop for RedirectRingbufThread {
     fn drop(&mut self) {
         unsafe {
-            RtwqUnlockWorkQueue(self.thread_id)
-                .and_then(|_| RtwqShutdown())
-                .unwrap_or_else(|e| {
-                    error_tagged!(self.tag, "Encountered error when closing thread: {e}")
-                });
+            _ = RtwqUnlockWorkQueue(self.thread_id);
+            _ = RtwqShutdown();
         }
         info_tagged!(self.tag, "Consumer thread stopped");
     }
@@ -1574,7 +1572,7 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
             }
             buffer
                 .push_entire_slice(slice)
-                .unwrap_or_else(|e| warn_tagged!(self.tag, "push overflow! {e}"));
+                .unwrap_or_else(|e| error_tagged!(self.tag, "push overflow! {e}"));
             debug_tagged!(
                 self.tag,
                 "ReleaseBuffer called, written: {numframeswritten}"
