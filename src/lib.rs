@@ -4,7 +4,6 @@
 use core::ffi::c_void;
 use flexi_logger::*;
 use log::*;
-use rpmalloc::RpMalloc;
 use rtrb::{Consumer, Producer, RingBuffer};
 use serde::*;
 use std::cell::{Cell, OnceCell, UnsafeCell};
@@ -15,9 +14,6 @@ use std::path::Path;
 use std::slice::from_raw_parts_mut;
 use std::sync::{LazyLock, Once, OnceLock, atomic::*};
 
-#[global_allocator]
-static GLOBAL: RpMalloc = RpMalloc;
-
 use windows::{
     Win32::{
         Foundation::*,
@@ -27,8 +23,10 @@ use windows::{
         System::Threading::*,
         UI::Shell::PropertiesSystem::IPropertyStore,
     },
-    core::{Result as WinResult, *},
+    core::Result as WinResult,
 };
+
+use windows_core::*;
 
 static LOGGER_HANDLE: OnceLock<LoggerHandle> = OnceLock::new();
 

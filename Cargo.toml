@@ -1,6 +1,6 @@
 [package]
 name = "wasapi_relink"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 
 [dependencies]
@@ -23,8 +23,8 @@ serde = { version = "1.*", features = ["derive"] }
 toml = "1.*"
 # ringbuf = "0.*"
 rtrb = "0.4.*"
-rpmalloc = "0.2.*"
-neohook = "0.13.*"
+# rpmalloc = "0.2.*"
+neohook = "0.16.*"
 likely_stable = "0.1.*"
 # mimalloc = { version = "*", features = ["v3"] }
 # uuid = { version = "1.20.0", features = ["v4"] }
@@ -47,3 +47,6 @@ opt-level = 3
 lto = true
 strip = "symbols"
 panic = "abort"
+
+[build-dependencies]
+cc = "1.*"
