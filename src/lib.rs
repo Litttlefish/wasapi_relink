@@ -23,10 +23,8 @@ use windows::{
         System::Threading::*,
         UI::Shell::PropertiesSystem::IPropertyStore,
     },
-    core::Result as WinResult,
+    core::{Result as WinResult, *},
 };
-
-use windows_core::*;
 
 static LOGGER_HANDLE: OnceLock<LoggerHandle> = OnceLock::new();
 
