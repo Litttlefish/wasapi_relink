@@ -4,9 +4,13 @@
 
 个人见解,欢迎指正
 
-## DllMain安全
+## DllMain安全和初始化
 
-DllMain中不应该做的事(个人总结版): 开启/安排任何线程, `LoadLibrary*` 函数加载或用 `GetModuleHandleEx` 中会修改引用计数的参数获取HANDLE,考虑到这里 `GetModuleHandle` 获取的是 `combase`,这个要是失败了程序估计也就不正常了,不如直接炸掉(
+DllMain中不应该做的事(个人总结版): 开启/安排任何常规线程, `LoadLibrary*` 函数加载或用 `GetModuleHandleEx` 中会修改引用计数的参数获取除自身之外的HANDLE
+
+不能开常规线程是因为这个线程会在DllMain里再触发一轮 THREAD_ATTACH 的DllMain，二者要是有关联就会互相锁死，没有关联也可能有竟态，不过破局方法就是用ntdll的`NtCreateThreadEx`开一个会跳过 THREAD_ATTACH 的线程就行（
+
+初始化线程里考虑到这里 `GetModuleHandle` 获取的是 `combase`,这个要是失败了程序估计也就不正常了,不如直接炸掉(
 
 ## 大前提
 

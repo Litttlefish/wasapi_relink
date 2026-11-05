@@ -35,6 +35,9 @@ const PROPERTY: AudioClientProperties = const {
     prop
 };
 
+link!("ntdll.dll" "system" fn NtCreateThreadEx(handle: *mut HANDLE, access: THREAD_ACCESS_RIGHTS, objattrib: *mut c_void, process: HANDLE, routine: *mut (), args: *mut c_void, create_flags: u32, zero_bits: usize, stack_size: usize, max_stack_size: usize, attrib_list: *mut c_void) -> NTSTATUS);
+link!("MMDevAPI.dll" "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT);
+
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
 enum ConfigLogLevel {
     Trace,
@@ -229,8 +232,8 @@ unsafe extern "system" fn hooked_cocreateinstance(
     unsafe {
         let ret = COCREATEINSTANCE.unwrap_unchecked()(rclsid, punkouter, dwclscontext, riid, ppv);
         if *riid == IMMDeviceEnumerator::IID && ret.is_ok() {
-            LOGGER_HANDLE.get_or_init(setup);
-            if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
+            let name = GetThreadDescription(GetCurrentThread());
+            if let Ok(thread_desc) = name
                 && !thread_desc.is_empty()
                 && let Ok(name) = thread_desc.to_string()
                 && KEYWORDS.iter().any(|keyword| name.contains(keyword))
@@ -240,6 +243,7 @@ unsafe extern "system" fn hooked_cocreateinstance(
                 debug!("Intercepted IMMDeviceEnumerator creation via CoCreateInstance");
                 *ppv = IMMDeviceEnumerator::from(RedirectDeviceEnumerator::new(*ppv)).into_raw();
             }
+            LocalFree(name.map(|p| HLOCAL(p.as_ptr().cast())).ok());
         }
         ret
     }
@@ -273,8 +277,8 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
             presults,
         );
         if *clsid == MMDeviceEnumerator && hr.is_ok() {
-            LOGGER_HANDLE.get_or_init(setup);
-            if let Ok(thread_desc) = GetThreadDescription(GetCurrentThread())
+            let name = GetThreadDescription(GetCurrentThread());
+            if let Ok(thread_desc) = name
                 && !thread_desc.is_empty()
                 && let Ok(name) = thread_desc.to_string()
                 && KEYWORDS.iter().any(|keyword| name.contains(keyword))
@@ -292,8 +296,84 @@ unsafe extern "system" fn hooked_cocreateinstanceex(
                     }
                 }
             }
+            LocalFree(name.map(|p| HLOCAL(p.as_ptr().cast())).ok());
         }
         hr
+    }
+}
+
+static mut ENUMAUDIO: Option<
+    unsafe extern "system" fn(*mut c_void, EDataFlow, DEVICE_STATE, *mut *mut c_void) -> HRESULT,
+> = None;
+unsafe extern "system" fn hooked_enum_audio(
+    this: *mut c_void,
+    dataflow: EDataFlow,
+    dwstatemask: DEVICE_STATE,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    unsafe {
+        let hr = ENUMAUDIO.unwrap_unchecked()(this, dataflow, dwstatemask, ppv);
+        if hr.is_ok() && check_thread() {
+            *ppv = IMMDeviceCollection::from(RedirectDeviceCollection(
+                IMMDeviceCollection::from_raw(*ppv),
+            ))
+            .into_raw();
+        }
+        hr
+    }
+}
+
+static mut DEFAULTAUDIO: Option<
+    unsafe extern "system" fn(*mut c_void, EDataFlow, ERole, *mut *mut c_void) -> HRESULT,
+> = None;
+unsafe extern "system" fn hooked_default_audio(
+    this: *mut c_void,
+    dataflow: EDataFlow,
+    role: ERole,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    unsafe {
+        let hr = DEFAULTAUDIO.unwrap_unchecked()(this, dataflow, role, ppv);
+        if hr.is_ok() && check_thread() {
+            *ppv = IMMDevice::from(RedirectDevice::new(IMMDevice::from_raw(*ppv))).into_raw();
+        }
+        hr
+    }
+}
+
+static mut DEVICE: Option<
+    unsafe extern "system" fn(*mut c_void, *const PCWSTR, *mut *mut c_void) -> HRESULT,
+> = None;
+unsafe extern "system" fn hooked_device(
+    this: *mut c_void,
+    device: *const PCWSTR,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    unsafe {
+        let hr = DEVICE.unwrap_unchecked()(this, device, ppv);
+        if hr.is_ok() && check_thread() {
+            *ppv = IMMDevice::from(RedirectDevice::new(IMMDevice::from_raw(*ppv))).into_raw();
+        }
+        hr
+    }
+}
+
+fn check_thread() -> bool {
+    unsafe {
+        let name = GetThreadDescription(GetCurrentThread());
+        let result = if let Ok(thread_desc) = name
+            && !thread_desc.is_empty()
+            && let Ok(name) = thread_desc.to_string()
+            && KEYWORDS.iter().any(|keyword| name.contains(keyword))
+        {
+            trace!("Skipping SpecialK calls, thread name: {name}");
+            false
+        } else {
+            debug!("Intercepted IMMDeviceEnumerator");
+            true
+        };
+        LocalFree(name.map(|p| HLOCAL(p.as_ptr().cast())).ok());
+        result
     }
 }
 
@@ -1592,10 +1672,48 @@ fn formatter(
     write!(w, "{}", record.args())
 }
 
-fn setup() -> LoggerHandle {
+fn setup() -> u32 {
     std::panic::set_hook(Box::new(|panic_info| {
         error!("{panic_info}");
     }));
+    unsafe {
+        let mut session = neohook::DetourTransaction::begin();
+        session.update_all_threads();
+        let mut factory = std::ptr::null_mut();
+        _ = DllGetClassObject(&MMDeviceEnumerator, &IClassFactory::IID, &mut factory);
+        let enumerator = IClassFactory::from_raw(factory)
+            .CreateInstance::<_, IMMDeviceEnumerator>(None)
+            .unwrap();
+        let vtbl = enumerator.vtable();
+        ENUMAUDIO = session
+            .attach(vtbl.EnumAudioEndpoints as _, hooked_enum_audio as _)
+            .map(|p| transmute(p))
+            .ok();
+        DEFAULTAUDIO = session
+            .attach(vtbl.GetDefaultAudioEndpoint as _, hooked_default_audio as _)
+            .map(|p| transmute(p))
+            .ok();
+        DEVICE = session
+            .attach(vtbl.GetDevice as _, hooked_device as _)
+            .map(|p| transmute(p))
+            .ok();
+        // let module = GetModuleHandleW(w!("combase")).expect("combase.dll not found in process");
+        // COCREATEINSTANCE = session
+        //     .attach(
+        //         GetProcAddress(module, s!("CoCreateInstance")).unwrap_unchecked() as _,
+        //         hooked_cocreateinstance as _,
+        //     )
+        //     .map(|p| transmute(p))
+        //     .ok();
+        // COCREATEINSTANCEEX = session
+        //     .attach(
+        //         GetProcAddress(module, s!("CoCreateInstanceEx")).unwrap_unchecked() as _,
+        //         hooked_cocreateinstanceex as _,
+        //     )
+        //     .map(|p| transmute(p))
+        //     .ok();
+        core::mem::forget(session.commit().expect("transaction failed"));
+    }
     let logger = Logger::with(LevelFilter::from(CONFIG.log_level))
         .format(formatter)
         .write_mode(WriteMode::Async);
@@ -1635,44 +1753,36 @@ fn setup() -> LoggerHandle {
             info!("Config file not found, using default values")
         }
     }
-    unsafe {
-        let mut _discard = HMODULE::default();
-        GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            PCWSTR::from_raw(proxy_dummy as _),
-            &mut _discard,
-        )
-        .ok();
-    }
-    handle
+
+    _ = LOGGER_HANDLE.set(handle);
+    0
 }
 
 #[unsafe(export_name = "proxy")]
 extern "C" fn proxy_dummy() {}
 
 #[unsafe(no_mangle)]
-unsafe extern "system" fn DllMain(hinstance: HINSTANCE, reason: u32, _: *mut c_void) -> BOOL {
+unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut c_void) -> BOOL {
     match reason {
         1 => unsafe {
-            let mut session = neohook::DetourTransaction::begin();
-            session.update_all_threads();
-            let module = GetModuleHandleW(w!("combase")).expect("combase.dll not found in process");
-            COCREATEINSTANCE = session
-                .attach(
-                    GetProcAddress(module, s!("CoCreateInstance")).unwrap_unchecked() as _,
-                    hooked_cocreateinstance as _,
-                )
-                .map(|p| transmute(p))
-                .ok();
-            COCREATEINSTANCEEX = session
-                .attach(
-                    GetProcAddress(module, s!("CoCreateInstanceEx")).unwrap_unchecked() as _,
-                    hooked_cocreateinstanceex as _,
-                )
-                .map(|p| transmute(p))
-                .ok();
-            core::mem::forget(session.commit().expect("transaction failed"));
-            DisableThreadLibraryCalls(hinstance.into()).is_ok().into()
+            let mut handle = HANDLE::default();
+            _ = NtCreateThreadEx(
+                &raw mut handle,
+                THREAD_ALL_ACCESS,
+                core::ptr::null_mut(),
+                GetCurrentProcess(),
+                setup as _,
+                core::ptr::null_mut(),
+                0x2, // THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH
+                0,
+                0,
+                0,
+                core::ptr::null_mut(),
+            );
+            handle.free();
+            let mut discard = HMODULE::default();
+            GetModuleHandleExW(1 | 4, PCWSTR::from_raw(proxy_dummy as _), &mut discard).ok();
+            DisableThreadLibraryCalls(discard).is_ok().into()
         },
         _ => TRUE,
     }

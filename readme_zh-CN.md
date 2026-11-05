@@ -248,7 +248,7 @@ compat_buffer_dur_hns.96000 = 250000  # 为 96kHz 指定一个值
 例如：
 
 ```toml
-log_path = "C:\\Users\\Public\\wasapi_relink.log"
+log_path = "C:\\Users\\Public"
 ```
 
 如果你不需要输出到文件，也可以使用 `only_log_stdout` 关闭:
