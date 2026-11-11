@@ -10,7 +10,7 @@ DllMain中不应该做的事(个人总结版): 开启/安排任何常规线程, 
 
 不能开常规线程是因为这个线程会在DllMain里再触发一轮 THREAD_ATTACH 的DllMain，二者要是有关联就会互相锁死，没有关联也可能有竟态，不过破局方法就是用ntdll的`NtCreateThreadEx`开一个会跳过 THREAD_ATTACH 的线程就行（
 
-初始化线程里考虑到这里 `GetModuleHandle` 获取的是 `combase`,这个要是失败了程序估计也就不正常了,不如直接炸掉(
+而初始化线程里除了自己引入的`MMDevApi.dll`外什么都没有，完全没有引用计数问题（
 
 ## 大前提
 

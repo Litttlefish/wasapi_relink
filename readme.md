@@ -120,11 +120,13 @@ To facilitate use with stub generators, `wasapi_relink.dll` additionally exports
 
 This function does nothing on its own; it exists only as a definitive "entry point".
 
-**DO NOT use `ole32.dll` when generating DLL stubs.** Doing so can cause infinite recursion during `LoadLibrary`/COM activation and lead to unstable or hard-to-debug behavior (e.g., repeated loader calls, crashes, or the target process hanging).
+**Choose your stub type carefully.** An earlier version of this module intercepted COM activation by hooking `combase`'s `CoCreate` series, at which time using `ole32.dll` as a stub could cause infinite recursion. The current version instead obtains instances from `MMDevAPI.dll`'s `DllGetClassObject` and performs an inline hook on `IMMDevice::Activate`, no longer using the `CoCreate` activation chain, so recursion should no longer be triggered unless `MMDevAPI.dll` is intentionally used as a stub.
+
+However, general DLL proxy caveats still apply: ensure the stub correctly forwards to the real DLL, and avoid `LoadLibrary` paths or hook call chains resolving back to the module itself.
 
 ## Configuration (`redirect_config.toml`)
 
-The configuration file `redirect_config.toml` **must** be placed in the same directory(or working directory) as the DLL. If an entry is not specified, default value will be used.
+The configuration file `redirect_config.toml` **must** be placed in the working directory (usually the DLL's directory). If an entry is not specified, default value will be used.
 
 ```toml
 # Path for the log file. "" (empty string) defaults to the working directory.
@@ -135,7 +137,7 @@ log_level = "Info"
 only_log_stdout = false
 
 [capture]
-# (General) Target device period in 0.1ms units (u16).
+# (General) Target device period in 0.1ms units (u32).
 # The tool will calculate the closest period *not exceeding* this duration while clamped within driver range.
 # e.g., 20 = 2.0ms.
 target_period_hus = 20
@@ -324,30 +326,32 @@ Ringbuf mode inserts a high-performance software decoupler between the audio eng
 
 **The App Side:** The game is tricked into thinking it is talking to a much larger, traditional buffer. It writes its large fixed-frame chunks or polls at its leisure into this safe zone.
 
-## Implementation: The COM Wrapper Chain
+## Implementation: Inline hooking the method within COM vtable
 
-`wasapi_relink` does not use simple VTable hooking. It hooks at the root of the COM audio system to ensure 100% capture.
+`wasapi_relink` does not use simple VTable hooking. It does use VTable, but performs inline hooks starting from the prototype functions to ensure no trigger points are missed.
 
-1. **Hook:** `CoCreateInstanceEx`.
+1. Call `DllGetClassObject` through the statically linked `MMDevApi.dll` to obtain `IMMDeviceEnumerator`.
 
-2. **Intercept:** When the app requests `CLSID_MMDeviceEnumerator` (the main audio device enumerator), `wasapi_relink` creates the real one and returns a custom **wrapped** `IMMDeviceEnumerator` to the app.
+2. As long as there is still an active device, this original `IMMDeviceEnumerator` can obtain an `IMMDevice` through the call chain, and find the `Activate` method through its VTable, performing an inline hook on it.
 
-3. **Propagate:** When the app requests device on this wrapper, `wasapi_relink` returns a wrapped `IMMDevice`.
+3. When the application subsequently uses `IMMDevice`, `wasapi_relink` makes the following choices based on the configuration and returns a wrapped `IAudioClient`:
 
-    3.1. **Compat Mode:** When the app calls `Activate` on the wrapped `IMMDevice`, `wasapi_relink` executes its core Compat Mode logic (creating the two clients) and returns *one* wrapped `IAudioClient`.
+    3.1. **Compat Mode:** Executes Compat Mode logic (creates two clients) and returns *one* wrapped `IAudioClient`.
 
-    3.2. **Normal Mode:** When the app calls `Initialize` on the wrapped `IAudioClient`, the Normal Mode logic is executed.
+    3.2. **Normal Mode:** Executes Normal Mode logic, returning a low-latency stream disguised as a normal shared stream.
 
-    3.3. **Ringbuf Mode:** When the app calls `Initialize`, it will enable event callback, setup low-latency stream, choose modes based on program behavior, and creates consumer thread.
+    3.3. **Ringbuf Mode:** Forces event callback on, enables the low-latency stream, chooses between injection or inverse mode based on application behavior, and creates the consumer thread.
 
 4. This wrapper chain continues all the way down to `IAudioRenderClient`, giving `wasapi_relink` full, transparent control over the entire audio stream lifecycle.
 
-### A Note on Capture (Microphone)
+### A Note on Capture (Microphone/Loopback) and Exclusive Mode
 
 In **Compat/Ringbuf Mode**, capture (mic) streams are simply forwarded. This *is* intentional:
 
-1. Mic latency is far less critical in Shared mode compared to effects or network latency. Due to the nature of capture streams, which don’t require a silent pre-fill buffer in their interaction with the driver, triggering Windows’ special behavior is by itself sufficient to reduce latency.
+1. Mic latency is far less critical in Shared mode compared to effects or network latency. Due to the nature of capture streams, which don't require a silent pre-fill buffer in their interaction with the driver, triggering Windows' special behavior is by itself sufficient to reduce latency.
 2. Users with true low-latency input needs are already using `ASIO` or `WASAPI Exclusive` mode, which this tool does not target.
+
+Additionally, Exclusive mode will error out in Compat mode and is forwarded in other modes; this is also intentional.
 
 ---
 

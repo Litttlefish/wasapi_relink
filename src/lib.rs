@@ -1,6 +1,3 @@
-// #[cfg(test)]
-// mod config_test;
-
 use core::ffi::c_void;
 use flexi_logger::*;
 use log::*;
@@ -8,7 +5,6 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use serde::*;
 use std::cell::{Cell, OnceCell, UnsafeCell};
 use std::collections::HashMap;
-use std::mem::transmute;
 use std::num::NonZero;
 use std::path::Path;
 use std::slice::from_raw_parts_mut;
@@ -21,7 +17,6 @@ use windows::{
         System::Com::{StructuredStorage::*, *},
         System::LibraryLoader::*,
         System::Threading::*,
-        UI::Shell::PropertiesSystem::IPropertyStore,
     },
     core::{Result as WinResult, *},
 };
@@ -213,246 +208,8 @@ static CLIENT_ID: (AtomicU16, AtomicU16) = (AtomicU16::new(0), AtomicU16::new(0)
 
 const KEYWORDS: &[&str] = &["[GAME]", "[SK]"];
 
-static mut COCREATEINSTANCE: Option<
-    unsafe extern "system" fn(
-        *const GUID,
-        *mut c_void,
-        CLSCTX,
-        *const GUID,
-        *mut *mut c_void,
-    ) -> HRESULT,
-> = None;
-unsafe extern "system" fn hooked_cocreateinstance(
-    rclsid: *const GUID,
-    punkouter: *mut c_void,
-    dwclscontext: CLSCTX,
-    riid: *const GUID,
-    ppv: *mut *mut c_void,
-) -> HRESULT {
-    unsafe {
-        let ret = COCREATEINSTANCE.unwrap_unchecked()(rclsid, punkouter, dwclscontext, riid, ppv);
-        if *riid == IMMDeviceEnumerator::IID && ret.is_ok() {
-            let name = GetThreadDescription(GetCurrentThread());
-            if let Ok(thread_desc) = name
-                && !thread_desc.is_empty()
-                && let Ok(name) = thread_desc.to_string()
-                && KEYWORDS.iter().any(|keyword| name.contains(keyword))
-            {
-                trace!("Skipping SpecialK CoCreateInstance calls, thread name: {name}");
-            } else {
-                debug!("Intercepted IMMDeviceEnumerator creation via CoCreateInstance");
-                *ppv = IMMDeviceEnumerator::from(RedirectDeviceEnumerator::new(*ppv)).into_raw();
-            }
-            LocalFree(name.map(|p| HLOCAL(p.as_ptr().cast())).ok());
-        }
-        ret
-    }
-}
-
-static mut COCREATEINSTANCEEX: Option<
-    unsafe extern "system" fn(
-        *const GUID,
-        *mut c_void,
-        CLSCTX,
-        *const COSERVERINFO,
-        u32,
-        *mut MULTI_QI,
-    ) -> HRESULT,
-> = None;
-unsafe extern "system" fn hooked_cocreateinstanceex(
-    clsid: *const GUID,
-    punkouter: *mut c_void,
-    dwclsctx: CLSCTX,
-    pserverinfo: *const COSERVERINFO,
-    dwcount: u32,
-    presults: *mut MULTI_QI,
-) -> HRESULT {
-    unsafe {
-        let hr = COCREATEINSTANCEEX.unwrap_unchecked()(
-            clsid,
-            punkouter,
-            dwclsctx,
-            pserverinfo,
-            dwcount,
-            presults,
-        );
-        if *clsid == MMDeviceEnumerator && hr.is_ok() {
-            let name = GetThreadDescription(GetCurrentThread());
-            if let Ok(thread_desc) = name
-                && !thread_desc.is_empty()
-                && let Ok(name) = thread_desc.to_string()
-                && KEYWORDS.iter().any(|keyword| name.contains(keyword))
-            {
-                trace!("Skipping SpecialK CoCreateInstanceEx calls, thread name: {name}")
-            } else {
-                for qi in from_raw_parts_mut(presults, dwcount as usize) {
-                    if *qi.pIID == IMMDeviceEnumerator::IID && qi.hr.is_ok() {
-                        debug!("Intercepted IMMDeviceEnumerator via CoCreateInstanceEx");
-                        let proxy_enumerator =
-                            IMMDeviceEnumerator::from(RedirectDeviceEnumerator::new(
-                                qi.pItf.take().unwrap_unchecked().into_raw(),
-                            ));
-                        _ = qi.pItf.insert(proxy_enumerator.into())
-                    }
-                }
-            }
-            LocalFree(name.map(|p| HLOCAL(p.as_ptr().cast())).ok());
-        }
-        hr
-    }
-}
-
-static mut ENUMAUDIO: Option<
-    unsafe extern "system" fn(*mut c_void, EDataFlow, DEVICE_STATE, *mut *mut c_void) -> HRESULT,
-> = None;
-unsafe extern "system" fn hooked_enum_audio(
-    this: *mut c_void,
-    dataflow: EDataFlow,
-    dwstatemask: DEVICE_STATE,
-    ppv: *mut *mut c_void,
-) -> HRESULT {
-    unsafe {
-        let hr = ENUMAUDIO.unwrap_unchecked()(this, dataflow, dwstatemask, ppv);
-        if hr.is_ok() && check_thread() {
-            *ppv = IMMDeviceCollection::from(RedirectDeviceCollection(
-                IMMDeviceCollection::from_raw(*ppv),
-            ))
-            .into_raw();
-        }
-        hr
-    }
-}
-
-static mut DEFAULTAUDIO: Option<
-    unsafe extern "system" fn(*mut c_void, EDataFlow, ERole, *mut *mut c_void) -> HRESULT,
-> = None;
-unsafe extern "system" fn hooked_default_audio(
-    this: *mut c_void,
-    dataflow: EDataFlow,
-    role: ERole,
-    ppv: *mut *mut c_void,
-) -> HRESULT {
-    unsafe {
-        let hr = DEFAULTAUDIO.unwrap_unchecked()(this, dataflow, role, ppv);
-        if hr.is_ok() && check_thread() {
-            *ppv = IMMDevice::from(RedirectDevice::new(IMMDevice::from_raw(*ppv))).into_raw();
-        }
-        hr
-    }
-}
-
-static mut DEVICE: Option<
-    unsafe extern "system" fn(*mut c_void, *const PCWSTR, *mut *mut c_void) -> HRESULT,
-> = None;
-unsafe extern "system" fn hooked_device(
-    this: *mut c_void,
-    device: *const PCWSTR,
-    ppv: *mut *mut c_void,
-) -> HRESULT {
-    unsafe {
-        let hr = DEVICE.unwrap_unchecked()(this, device, ppv);
-        if hr.is_ok() && check_thread() {
-            *ppv = IMMDevice::from(RedirectDevice::new(IMMDevice::from_raw(*ppv))).into_raw();
-        }
-        hr
-    }
-}
-
-fn check_thread() -> bool {
-    unsafe {
-        let name = GetThreadDescription(GetCurrentThread());
-        let result = if let Ok(thread_desc) = name
-            && !thread_desc.is_empty()
-            && let Ok(name) = thread_desc.to_string()
-            && KEYWORDS.iter().any(|keyword| name.contains(keyword))
-        {
-            trace!("Skipping SpecialK calls, thread name: {name}");
-            false
-        } else {
-            debug!("Intercepted IMMDeviceEnumerator");
-            true
-        };
-        LocalFree(name.map(|p| HLOCAL(p.as_ptr().cast())).ok());
-        result
-    }
-}
-
-#[repr(transparent)]
-#[implement(IMMDeviceEnumerator)]
-struct RedirectDeviceEnumerator(IMMDeviceEnumerator);
-impl RedirectDeviceEnumerator {
-    fn new(inner: *mut c_void) -> Self {
-        Self(unsafe { IMMDeviceEnumerator::from_raw(inner) })
-    }
-}
-impl IMMDeviceEnumerator_Impl for RedirectDeviceEnumerator_Impl {
-    fn EnumAudioEndpoints(
-        &self,
-        dataflow: EDataFlow,
-        dwstatemask: DEVICE_STATE,
-    ) -> WinResult<IMMDeviceCollection> {
-        debug!(
-            "DeviceEnumerator::EnumAudioEndpoints requested on flow {}",
-            dataflow.0
-        );
-        Ok(IMMDeviceCollection::from(RedirectDeviceCollection(
-            unsafe { self.0.EnumAudioEndpoints(dataflow, dwstatemask)? },
-        )))
-    }
-
-    fn GetDefaultAudioEndpoint(&self, dataflow: EDataFlow, role: ERole) -> WinResult<IMMDevice> {
-        debug!(
-            "DeviceEnumerator::GetDefaultAudioEndpoint requested on flow {}",
-            dataflow.0
-        );
-        Ok(RedirectDevice::new(unsafe { self.0.GetDefaultAudioEndpoint(dataflow, role)? }).into())
-    }
-
-    fn GetDevice(&self, pwstrid: &PCWSTR) -> WinResult<IMMDevice> {
-        info!("DeviceEnumerator::GetDevice called, wrapping");
-        Ok(RedirectDevice::new(unsafe { self.0.GetDevice(*pwstrid)? }).into())
-    }
-
-    fn RegisterEndpointNotificationCallback(
-        &self,
-        pclient: Ref<IMMNotificationClient>,
-    ) -> WinResult<()> {
-        trace!("DeviceEnumerator::RegisterEndpointNotificationCallback called");
-        unsafe {
-            self.0
-                .RegisterEndpointNotificationCallback(pclient.as_ref())
-        }
-    }
-
-    fn UnregisterEndpointNotificationCallback(
-        &self,
-        pclient: Ref<IMMNotificationClient>,
-    ) -> WinResult<()> {
-        trace!("DeviceEnumerator::UnregisterEndpointNotificationCallback called");
-        unsafe {
-            self.0
-                .UnregisterEndpointNotificationCallback(pclient.as_ref())
-        }
-    }
-}
-
-#[repr(transparent)]
-#[implement(IMMDeviceCollection)]
-struct RedirectDeviceCollection(IMMDeviceCollection);
-impl IMMDeviceCollection_Impl for RedirectDeviceCollection_Impl {
-    fn GetCount(&self) -> WinResult<u32> {
-        trace!("DeviceCollection::GetCount called");
-        unsafe { self.0.GetCount() }
-    }
-
-    fn Item(&self, ndevice: u32) -> WinResult<IMMDevice> {
-        debug!("DeviceCollection::Item retrieved device {ndevice}");
-        Ok(RedirectDevice::new(unsafe { self.0.Item(ndevice)? }).into())
-    }
-}
-
 macro_rules! impl_boilerplate {
-    (IAudioClient1) => {
+    (IAudioClient) => {
         fn GetMixFormat(&self) -> WinResult<*mut WAVEFORMATEX> {
             info_tagged!(@self, "GetMixFormat called");
             unsafe { self.inner.GetMixFormat() }
@@ -495,6 +252,21 @@ macro_rules! impl_boilerplate {
                     phnsminbufferduration,
                     phnsmaxbufferduration,
                 )
+            }
+        }
+        fn SetClientProperties(&self, pproperties: *const AudioClientProperties) -> WinResult<()> {
+            info_tagged!(@self, "SetClientProperties called");
+            unsafe {
+                self.inner.SetClientProperties(if self.info.config.raw {
+                    let mut option = *pproperties;
+                    self.info.raw_flag.call_once(|| {
+                        info_tagged!(@self, "Applying raw flag");
+                    });
+                    option.Options |= AUDCLNT_STREAMOPTIONS_RAW;
+                    &option
+                } else {
+                    pproperties
+                })
             }
         }
     };
@@ -542,35 +314,64 @@ macro_rules! drop_boilerplate {
     };
 }
 
-#[repr(transparent)]
-#[implement(IMMDevice, IMMEndpoint)]
-struct RedirectDevice {
-    inner: IMMDevice,
-}
-
-impl RedirectDevice {
-    pub fn new(inner: IMMDevice) -> Self {
-        Self { inner }
+unsafe fn check_thread() -> bool {
+    unsafe {
+        let name = GetThreadDescription(GetCurrentThread());
+        let result = if let Ok(thread_desc) = name
+            && !thread_desc.is_empty()
+            && let Ok(name) = thread_desc.to_string()
+            && KEYWORDS.iter().any(|keyword| name.contains(keyword))
+        {
+            trace!("Skipping SpecialK calls, thread name: {name}");
+            true
+        } else {
+            false
+        };
+        LocalFree(name.map(|p| HLOCAL(p.as_ptr().cast())).ok());
+        result
     }
 }
 
-impl IMMDevice_Impl for RedirectDevice_Impl {
-    fn Activate(
-        &self,
-        riid: *const GUID,
-        dwclsctx: CLSCTX,
-        pactivationparams: *const PROPVARIANT,
-        ppinterface: *mut *mut c_void,
-    ) -> WinResult<()> {
-        unsafe {
-            let iid = *riid;
-            info!("Device::Activate called, iid: {iid:?}");
-            match iid {
-                IAudioClient::IID | IAudioClient2::IID | IAudioClient3::IID => {
-                    let inner: IAudioClient3 = self
-                        .inner
-                        .Activate::<IAudioClient3>(dwclsctx, Some(pactivationparams))?;
-                    let dataflow = self.inner.cast::<IMMEndpoint>()?.GetDataFlow()?.into();
+static mut ACTIVATE: Option<
+    unsafe extern "system" fn(
+        *mut c_void,
+        *const GUID,
+        CLSCTX,
+        *const PROPVARIANT,
+        *mut *mut c_void,
+    ) -> HRESULT,
+> = None;
+unsafe extern "system" fn hooked_activate(
+    this: *mut c_void,
+    riid: *const GUID,
+    dwclsctx: CLSCTX,
+    pactivationparams: *const PROPVARIANT,
+    ppinterface: *mut *mut c_void,
+) -> HRESULT {
+    unsafe {
+        let orig = ACTIVATE.unwrap_unchecked();
+        if check_thread() {
+            return orig(this, riid, dwclsctx, pactivationparams, ppinterface);
+        }
+        let iid = *riid;
+        info!("Device::Activate called, iid: {iid:?}");
+        let this_ref = IMMDevice::assume_init_ref(&this);
+        let ret = match iid {
+            IAudioClient::IID | IAudioClient2::IID | IAudioClient3::IID => {
+                let spawn_client = || -> WinResult<IAudioClient3> {
+                    let mut result = std::ptr::null_mut();
+                    orig(
+                        this,
+                        &IAudioClient3::IID,
+                        dwclsctx,
+                        pactivationparams,
+                        &raw mut result,
+                    )
+                    .and_then(|| IAudioClient3::from_abi(result))
+                };
+                let hr = (|| -> WinResult<IAudioClient3> {
+                    let inner = spawn_client()?;
+                    let dataflow = this_ref.cast::<IMMEndpoint>()?.GetDataFlow()?.into();
                     let config = CONFIG.get(dataflow);
                     let tag = format!(
                         "{dataflow}-{}::{}",
@@ -582,73 +383,34 @@ impl IMMDevice_Impl for RedirectDevice_Impl {
                     );
                     info_tagged!(tag, "Client created");
                     let info = RedirectClientInfo::new(config, tag.into());
-                    let proxy = match config.mode {
+                    Ok(match config.mode {
                         ClientMode::Normal => RedirectAudioClient::new(inner, info).into(),
-                        ClientMode::Compat => RedirectCompatAudioClient::new(
-                            inner,
-                            self.inner
-                                .Activate::<IAudioClient3>(dwclsctx, Some(pactivationparams))?,
-                            info,
-                        )
-                        .into(),
-                        ClientMode::Ringbuf => match dataflow {
-                            DeviceDataFlow::Playback => {
-                                RedirectRingbufAudioClient::new(inner, info).into()
-                            }
-                            DeviceDataFlow::Capture => {
-                                warn_tagged!(
-                                    info.tag,
-                                    "Ringbuf mode doesn't work with capture client, switching to compat mode"
-                                );
-                                RedirectCompatAudioClient::new(
-                                    inner,
-                                    self.inner.Activate::<IAudioClient3>(
-                                        dwclsctx,
-                                        Some(pactivationparams),
-                                    )?,
-                                    info,
-                                )
-                                .into()
-                            }
-                        },
+                        ClientMode::Compat if dataflow == DeviceDataFlow::Playback => {
+                            RedirectCompatAudioClient::new(inner, spawn_client()?, info).into()
+                        }
+                        ClientMode::Ringbuf if dataflow == DeviceDataFlow::Playback => {
+                            RedirectRingbufAudioClient::new(inner, info).into()
+                        }
                         ClientMode::Bypass => inner,
-                    };
-                    proxy.query(riid, ppinterface)
-                }
-                _ => (self.inner.vtable().Activate)(
-                    self.inner.as_raw(),
-                    riid,
-                    dwclsctx,
-                    pactivationparams,
-                    ppinterface,
-                )
-            }.ok()
-        }
-    }
-
-    fn OpenPropertyStore(&self, stgmaccess: STGM) -> WinResult<IPropertyStore> {
-        debug!("Device::OpenPropertyStore called");
-        unsafe { self.inner.OpenPropertyStore(stgmaccess) }
-    }
-
-    fn GetId(&self) -> WinResult<PWSTR> {
-        debug!("Device::GetId called");
-        unsafe { self.inner.GetId() }
-    }
-
-    fn GetState(&self) -> WinResult<DEVICE_STATE> {
-        trace!("Device::GetState called");
-        unsafe { self.inner.GetState() }
-    }
-}
-impl IMMEndpoint_Impl for RedirectDevice_Impl {
-    fn GetDataFlow(&self) -> WinResult<EDataFlow> {
-        trace!("Device::GetDataFlow called");
-        unsafe { self.inner.cast::<IMMEndpoint>()?.GetDataFlow() }
+                        _ => {
+                            warn_tagged!(
+                                info.tag,
+                                "Capture clients don't work with compat/ringbuf mode, bypassing"
+                            );
+                            inner
+                        }
+                    })
+                })()
+                .map_or_else(|e| e.code(), |proxy| proxy.query(riid, ppinterface));
+                hr
+            }
+            _ => orig(this, riid, dwclsctx, pactivationparams, ppinterface),
+        };
+        ret
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeviceDataFlow {
     Capture,
     Playback,
@@ -692,7 +454,9 @@ impl Shared3Info {
     fn init(inner: &IAudioClient3, config: &ClientConfig, tag: &str) -> WinResult<Self> {
         let mut periods = [0; 4];
         let pformat = unsafe { inner.GetMixFormat()? };
+        let samplerate = unsafe { *pformat }.nSamplesPerSec;
         unsafe {
+            CoTaskMemFree(Some(pformat.cast()));
             inner.GetSharedModeEnginePeriod(
                 pformat,
                 &mut periods[0],
@@ -701,8 +465,6 @@ impl Shared3Info {
                 &mut periods[3],
             )?
         };
-        let samplerate = unsafe { *pformat }.nSamplesPerSec;
-        unsafe { CoTaskMemFree(Some(pformat.cast())) };
         let current_period = if config.target_period_hus != 0 {
             calculate_buffer(samplerate, periods[1], config.target_period_hus)
                 .clamp(periods[2], periods[3])
@@ -763,7 +525,7 @@ impl RedirectAudioClient {
     }
 }
 impl IAudioClient_Impl for RedirectAudioClient_Impl {
-    impl_boilerplate!(IAudioClient1);
+    impl_boilerplate!(IAudioClient);
     fn Initialize(
         &self,
         sharemode: AUDCLNT_SHAREMODE,
@@ -774,27 +536,27 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
         audiosessionguid: *const GUID,
     ) -> WinResult<()> {
         if sharemode == AUDCLNT_SHAREMODE_EXCLUSIVE {
-            warn_tagged!(@self, "Rejected exclusive init");
-            return AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED.ok();
-        }
-        info_tagged!(
-            @self,
-            "Initialize -> redirecting, original dur: {hnsbufferduration} * 100ns"
-        );
-        if streamflags & AUDCLNT_STREAMFLAGS_LOOPBACK == 0 {
-            self.InitializeSharedAudioStream(streamflags, 0, pformat, audiosessionguid)
+            warn_tagged!(@self, "Bypassing exclusive");
         } else {
-            warn_tagged!(@self, "Bypassing loopback");
-            unsafe {
-                self.inner.Initialize(
-                    sharemode,
-                    streamflags,
-                    hnsbufferduration,
-                    hnsperiodicity,
-                    pformat,
-                    Some(audiosessionguid),
-                )
+            if streamflags & AUDCLNT_STREAMFLAGS_LOOPBACK == 0 {
+                info_tagged!(
+                    @self,
+                    "Initialize -> redirecting, original dur: {hnsbufferduration} * 100ns"
+                );
+                return self.InitializeSharedAudioStream(streamflags, 0, pformat, audiosessionguid);
+            } else {
+                warn_tagged!(@self, "Bypassing loopback");
             }
+        }
+        unsafe {
+            self.inner.Initialize(
+                sharemode,
+                streamflags,
+                hnsbufferduration,
+                hnsperiodicity,
+                pformat,
+                Some(audiosessionguid),
+            )
         }
     }
 
@@ -882,21 +644,6 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
 
 impl IAudioClient2_Impl for RedirectAudioClient_Impl {
     impl_boilerplate!(IAudioClient2);
-    fn SetClientProperties(&self, pproperties: *const AudioClientProperties) -> WinResult<()> {
-        info_tagged!(@self, "SetClientProperties called");
-        if self.info.config.raw {
-            self.info
-                .raw_flag
-                .call_once(|| info_tagged!(@self, "Applying raw flag"));
-            let option = &mut unsafe { *pproperties }.Options;
-            if option.contains(AUDCLNT_STREAMOPTIONS_RAW) {
-                warn_tagged!(@self, "This stream already has raw flag!")
-            } else {
-                *option |= AUDCLNT_STREAMOPTIONS_RAW
-            }
-        }
-        unsafe { self.inner.SetClientProperties(pproperties) }
-    }
 }
 
 impl IAudioClient3_Impl for RedirectAudioClient_Impl {
@@ -953,7 +700,7 @@ impl RedirectCompatAudioClient {
     }
 }
 impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
-    impl_boilerplate!(IAudioClient1);
+    impl_boilerplate!(IAudioClient);
     fn Initialize(
         &self,
         sharemode: AUDCLNT_SHAREMODE,
@@ -1061,10 +808,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
 
     fn SetEventHandle(&self, eventhandle: HANDLE) -> WinResult<()> {
         info_tagged!(@self, "SetEventHandle called");
-        unsafe {
-            _ = self.hooker.SetEventHandle(eventhandle);
-            self.inner.SetEventHandle(eventhandle)
-        }
+        unsafe { self.inner.SetEventHandle(eventhandle) }
     }
 
     fn GetService(&self, riid: *const GUID, ppv: *mut *mut c_void) -> WinResult<()> {
@@ -1120,28 +864,13 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
 
 impl IAudioClient2_Impl for RedirectCompatAudioClient_Impl {
     impl_boilerplate!(IAudioClient2);
-    fn SetClientProperties(&self, pproperties: *const AudioClientProperties) -> WinResult<()> {
-        info_tagged!(@self, "SetClientProperties called");
-        if self.info.config.raw {
-            self.info
-                .raw_flag
-                .call_once(|| info_tagged!(@self, "Applying raw flag"));
-            let option = &mut unsafe { *pproperties }.Options;
-            if option.contains(AUDCLNT_STREAMOPTIONS_RAW) {
-                warn_tagged!(@self, "This stream already has raw flag!")
-            } else {
-                *option |= AUDCLNT_STREAMOPTIONS_RAW
-            }
-        }
-        unsafe { self.inner.SetClientProperties(pproperties) }
-    }
 }
 
 impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
     impl_boilerplate!(IAudioClient3);
     fn InitializeSharedAudioStream(
         &self,
-        streamflags: u32,
+        mut streamflags: u32,
         periodinframes: u32,
         pformat: *const WAVEFORMATEX,
         audiosessionguid: *const GUID,
@@ -1160,6 +889,7 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
                 );
                 &self.inner
             } else {
+                streamflags = 0;
                 &self.hooker
             }.InitializeSharedAudioStream(
                 streamflags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -1268,7 +998,7 @@ impl RedirectRingbufAudioClient {
 }
 
 impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
-    impl_boilerplate!(IAudioClient1);
+    impl_boilerplate!(IAudioClient);
     fn Initialize(
         &self,
         sharemode: AUDCLNT_SHAREMODE,
@@ -1279,27 +1009,27 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
         audiosessionguid: *const GUID,
     ) -> WinResult<()> {
         if sharemode == AUDCLNT_SHAREMODE_EXCLUSIVE {
-            warn_tagged!(@self, "Rejected exclusive init");
-            return AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED.ok();
-        }
-        info_tagged!(
-            @self,
-            "Initialize -> adding ring buffer, original dur = {hnsbufferduration} * 100ns"
-        );
-        if streamflags & AUDCLNT_STREAMFLAGS_LOOPBACK == 0 {
-            self.InitializeSharedAudioStream(streamflags, 0, pformat, audiosessionguid)
+            warn_tagged!(@self, "Bypassing exclusive");
         } else {
-            warn_tagged!(@self, "Bypassing loopback");
-            unsafe {
-                self.inner.Initialize(
-                    sharemode,
-                    streamflags,
-                    hnsbufferduration,
-                    hnsperiodicity,
-                    pformat,
-                    Some(audiosessionguid),
-                )
+            if streamflags & AUDCLNT_STREAMFLAGS_LOOPBACK == 0 {
+                info_tagged!(
+                    @self,
+                    "Initialize -> redirecting, original dur: {hnsbufferduration} * 100ns"
+                );
+                return self.InitializeSharedAudioStream(streamflags, 0, pformat, audiosessionguid);
+            } else {
+                warn_tagged!(@self, "Bypassing loopback");
             }
+        }
+        unsafe {
+            self.inner.Initialize(
+                sharemode,
+                streamflags,
+                hnsbufferduration,
+                hnsperiodicity,
+                pformat,
+                Some(audiosessionguid),
+            )
         }
     }
 
@@ -1366,7 +1096,7 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
             let outer: &RedirectRingbufAudioRenderClient = unsafe { outer.as_impl() };
             outer.trick.set(false);
             let thread: &RedirectRingbufThread = unsafe { rthread.as_impl() };
-            thread.pause.store(0, Ordering::Relaxed);
+            thread.pause.store(0, Ordering::Release);
             if !thread.init.is_completed() {
                 thread.init.call_once(|| {
                     thread.app_handle.set(
@@ -1384,9 +1114,14 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
         info_tagged!(@self, "Stop called");
         if let Some((_, thread)) = self.outer.get() {
             let thread: &RedirectRingbufThread = unsafe { thread.as_impl() };
-            thread.pause.store(2, Ordering::Relaxed);
-            while thread.pause.load(Ordering::Relaxed) == 2 {
-                std::hint::spin_loop();
+            if thread
+                .pause
+                .compare_exchange_weak(0, 2, Ordering::Release, Ordering::Acquire)
+                .is_ok()
+            {
+                while thread.pause.load(Ordering::Acquire) == 2 {
+                    std::hint::spin_loop();
+                }
             }
         }
         unsafe { self.inner.Stop() }
@@ -1475,21 +1210,6 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
 
 impl IAudioClient2_Impl for RedirectRingbufAudioClient_Impl {
     impl_boilerplate!(IAudioClient2);
-    fn SetClientProperties(&self, pproperties: *const AudioClientProperties) -> WinResult<()> {
-        info_tagged!(@self, "SetClientProperties called");
-        if self.info.config.raw {
-            self.info
-                .raw_flag
-                .call_once(|| info_tagged!(@self, "Applying raw flag"));
-            let option = &mut unsafe { *pproperties }.Options;
-            if option.contains(AUDCLNT_STREAMOPTIONS_RAW) {
-                warn_tagged!(@self, "This stream already has raw flag!")
-            } else {
-                *option |= AUDCLNT_STREAMOPTIONS_RAW
-            }
-        }
-        unsafe { self.inner.SetClientProperties(pproperties) }
-    }
 }
 
 impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
@@ -1554,10 +1274,10 @@ impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
             return Ok(());
         } else {
             unsafe { RtwqPutWaitingWorkItem(*self.event, 1, pasyncresult.as_ref(), None)? }
-            match self.pause.load(Ordering::Relaxed) {
+            match self.pause.load(Ordering::Acquire) {
                 1 => return Ok(()),
                 2 => {
-                    self.pause.store(1, Ordering::Relaxed);
+                    self.pause.store(1, Ordering::Release);
                     return Ok(());
                 }
                 _ => (),
@@ -1672,48 +1392,23 @@ fn formatter(
     write!(w, "{}", record.args())
 }
 
-fn setup() -> u32 {
+fn get_device() -> WinResult<IMMDevice> {
+    unsafe {
+        let collection = {
+            let mut factory = std::ptr::null_mut();
+            DllGetClassObject(&MMDeviceEnumerator, &IClassFactory::IID, &mut factory)
+                .and_then(|| IClassFactory::from_abi(factory))
+        }?
+        .CreateInstance::<_, IMMDeviceEnumerator>(None)?
+        .EnumAudioEndpoints(EDataFlow(2), DEVICE_STATE(1))?;
+        collection.Item(0)
+    }
+}
+
+extern "system" fn setup(_: *mut c_void) -> u32 {
     std::panic::set_hook(Box::new(|panic_info| {
         error!("{panic_info}");
     }));
-    unsafe {
-        let mut session = neohook::DetourTransaction::begin();
-        session.update_all_threads();
-        let mut factory = std::ptr::null_mut();
-        _ = DllGetClassObject(&MMDeviceEnumerator, &IClassFactory::IID, &mut factory);
-        let enumerator = IClassFactory::from_raw(factory)
-            .CreateInstance::<_, IMMDeviceEnumerator>(None)
-            .unwrap();
-        let vtbl = enumerator.vtable();
-        ENUMAUDIO = session
-            .attach(vtbl.EnumAudioEndpoints as _, hooked_enum_audio as _)
-            .map(|p| transmute(p))
-            .ok();
-        DEFAULTAUDIO = session
-            .attach(vtbl.GetDefaultAudioEndpoint as _, hooked_default_audio as _)
-            .map(|p| transmute(p))
-            .ok();
-        DEVICE = session
-            .attach(vtbl.GetDevice as _, hooked_device as _)
-            .map(|p| transmute(p))
-            .ok();
-        // let module = GetModuleHandleW(w!("combase")).expect("combase.dll not found in process");
-        // COCREATEINSTANCE = session
-        //     .attach(
-        //         GetProcAddress(module, s!("CoCreateInstance")).unwrap_unchecked() as _,
-        //         hooked_cocreateinstance as _,
-        //     )
-        //     .map(|p| transmute(p))
-        //     .ok();
-        // COCREATEINSTANCEEX = session
-        //     .attach(
-        //         GetProcAddress(module, s!("CoCreateInstanceEx")).unwrap_unchecked() as _,
-        //         hooked_cocreateinstanceex as _,
-        //     )
-        //     .map(|p| transmute(p))
-        //     .ok();
-        core::mem::forget(session.commit().expect("transaction failed"));
-    }
     let logger = Logger::with(LevelFilter::from(CONFIG.log_level))
         .format(formatter)
         .write_mode(WriteMode::Async);
@@ -1753,7 +1448,22 @@ fn setup() -> u32 {
             info!("Config file not found, using default values")
         }
     }
-
+    unsafe {
+        _ = CoInitializeEx(None, COINIT(0));
+        let mut session = neohook::DetourTransaction::begin();
+        if let Ok(device) = get_device() {
+            ACTIVATE = session
+                .attach(device.vtable().Activate as _, hooked_activate as _)
+                .map(|p| std::mem::transmute(p))
+                .ok();
+            session.update_all_threads();
+            core::mem::forget(session.commit().expect("transaction failed"));
+        } else {
+            error!("Failed to get default device, skipping hook");
+            session.abort();
+        }
+        CoUninitialize();
+    }
     _ = LOGGER_HANDLE.set(handle);
     0
 }
