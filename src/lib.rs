@@ -61,7 +61,7 @@ impl From<ConfigLogLevel> for LevelFilter {
 enum ConfigSource {
     #[default]
     Success,
-    NoParse,
+    NoParse(toml::de::Error),
     NoFile,
 }
 
@@ -82,7 +82,7 @@ impl RedirectConfig {
             |_| Self::new_with_source(ConfigSource::NoFile),
             |str| {
                 toml::from_str::<RedirectConfig>(&str)
-                    .unwrap_or_else(|_| Self::new_with_source(ConfigSource::NoParse))
+                    .unwrap_or_else(|e| Self::new_with_source(ConfigSource::NoParse(e)))
             },
         )
     }
@@ -1441,8 +1441,8 @@ extern "system" fn setup(_: *mut c_void) -> u32 {
     );
     match CONFIG.source {
         ConfigSource::Success => info!("Config loaded!"),
-        ConfigSource::NoParse => {
-            warn!("Unable to parse config, using default values")
+        ConfigSource::NoParse(ref e) => {
+            warn!("Unable to parse config: {e}, using default values")
         }
         ConfigSource::NoFile => {
             info!("Config file not found, using default values")
