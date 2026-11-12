@@ -1456,9 +1456,9 @@ extern "C" fn proxy_dummy() {}
 unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut c_void) -> BOOL {
     match reason {
         1 => unsafe {
-            let mut handle = HANDLE::default();
+            let mut handle = Owned::<HANDLE>::default();
             _ = NtCreateThreadEx(
-                &raw mut handle,
+                &mut *handle,
                 THREAD_ALL_ACCESS,
                 core::ptr::null_mut(),
                 GetCurrentProcess(),
@@ -1470,7 +1470,6 @@ unsafe extern "system" fn DllMain(_: HINSTANCE, reason: u32, _: *mut c_void) -> 
                 0,
                 core::ptr::null_mut(),
             );
-            handle.free();
             let mut discard = HMODULE::default();
             GetModuleHandleExW(1 | 4, PCWSTR::from_raw(proxy_dummy as _), &mut discard).ok();
             DisableThreadLibraryCalls(discard).is_ok().into()
