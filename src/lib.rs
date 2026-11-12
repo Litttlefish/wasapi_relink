@@ -436,14 +436,15 @@ impl Shared3Info {
         let pformat = unsafe { inner.GetMixFormat()? };
         let samplerate = unsafe { *pformat }.nSamplesPerSec;
         unsafe {
-            CoTaskMemFree(Some(pformat.cast()));
-            inner.GetSharedModeEnginePeriod(
-                pformat,
-                &mut periods[0],
-                &mut periods[1],
-                &mut periods[2],
-                &mut periods[3],
-            )?
+            inner
+                .GetSharedModeEnginePeriod(
+                    pformat,
+                    &mut periods[0],
+                    &mut periods[1],
+                    &mut periods[2],
+                    &mut periods[3],
+                )
+                .and(Ok(CoTaskMemFree(Some(pformat.cast()))))? // it eagers for free
         };
         let current_period = if config.target_period_hus != 0 {
             calculate_buffer(samplerate, periods[1], config.target_period_hus)
@@ -850,7 +851,7 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
     impl_boilerplate!(IAudioClient3);
     fn InitializeSharedAudioStream(
         &self,
-        mut streamflags: u32,
+        streamflags: u32,
         periodinframes: u32,
         pformat: *const WAVEFORMATEX,
         audiosessionguid: *const GUID,
@@ -862,17 +863,17 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
         self.align.set(unsafe { (*pformat).nBlockAlign });
         self.info.initialized.set(true);
         unsafe {
-            if periodinframes != 0 {
+            let (client, flag) = if periodinframes != 0 {
                 info_tagged!(
                     @self,
                     "InitializeSharedAudioStream -> clamping prefill, original period: {periodinframes}"
                 );
-                &self.inner
+                (&self.inner, streamflags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK)
             } else {
-                streamflags = 0;
-                &self.hooker
-            }.InitializeSharedAudioStream(
-                streamflags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                (&self.hooker, 0)
+            };
+            client.InitializeSharedAudioStream(
+                flag,
                 self.info.param(&self.inner)?.current_period,
                 pformat,
                 Some(audiosessionguid),
@@ -1161,7 +1162,7 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
                         app_handle: None.into(),
                         thread_id: ids[1],
                         tag: format!("{}-thread", self.info.tag).into(),
-                        pause: 0.into(),
+                        pause: 1.into(),
                         init: Once::new(),
                     };
                     let client = IAudioRenderClient::from(RedirectRingbufAudioRenderClient {
