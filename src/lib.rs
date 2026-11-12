@@ -33,7 +33,7 @@ const PROPERTY: AudioClientProperties = const {
 link!("ntdll.dll" "system" fn NtCreateThreadEx(handle: *mut HANDLE, access: THREAD_ACCESS_RIGHTS, objattrib: *mut c_void, process: HANDLE, routine: *mut (), args: *mut c_void, create_flags: u32, zero_bits: usize, stack_size: usize, max_stack_size: usize, attrib_list: *mut c_void) -> NTSTATUS);
 link!("MMDevAPI.dll" "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT);
 
-#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq, Clone, Copy)]
 enum ConfigLogLevel {
     Trace,
     Debug,
@@ -65,7 +65,7 @@ enum ConfigSource {
     NoFile,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct RedirectConfig {
     log_path: Option<Box<Path>>,
@@ -101,7 +101,7 @@ impl RedirectConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct ClientConfig {
     target_period_hus: u32,
@@ -129,27 +129,13 @@ impl ClientConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Default, PartialEq, Eq)]
 enum ClientMode {
     #[default]
     Normal,
     Compat,
     Ringbuf,
     Bypass,
-}
-impl std::fmt::Display for ClientMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::Normal => "normal",
-                Self::Compat => "compat",
-                Self::Ringbuf => "ringbuf",
-                Self::Bypass => "bypass",
-            }
-        )
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -373,13 +359,19 @@ unsafe extern "system" fn hooked_activate(
                     let inner = spawn_client()?;
                     let dataflow = this_ref.cast::<IMMEndpoint>()?.GetDataFlow()?.into();
                     let config = CONFIG.get(dataflow);
+                    let (flow, counter) = match dataflow {
+                        DeviceDataFlow::Playback => ("playback", &CLIENT_ID.0),
+                        DeviceDataFlow::Capture => ("capture", &CLIENT_ID.1),
+                    };
                     let tag = format!(
-                        "{dataflow}-{}::{}",
-                        match dataflow {
-                            DeviceDataFlow::Playback => CLIENT_ID.0.fetch_add(1, Ordering::Relaxed),
-                            DeviceDataFlow::Capture => CLIENT_ID.1.fetch_add(1, Ordering::Relaxed),
-                        },
-                        config.mode
+                        "{flow}-{}::{}",
+                        counter.fetch_add(1, Ordering::Relaxed),
+                        match config.mode {
+                            ClientMode::Normal => "normal",
+                            ClientMode::Compat => "compat",
+                            ClientMode::Ringbuf => "ringbuf",
+                            ClientMode::Bypass => "bypass",
+                        }
                     );
                     info_tagged!(tag, "Client created");
                     let info = RedirectClientInfo::new(config, tag.into());
@@ -422,18 +414,6 @@ impl From<EDataFlow> for DeviceDataFlow {
             1 => Self::Capture,
             _ => unreachable!(),
         }
-    }
-}
-impl std::fmt::Display for DeviceDataFlow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::Capture => "capture",
-                Self::Playback => "playback",
-            }
-        )
     }
 }
 
