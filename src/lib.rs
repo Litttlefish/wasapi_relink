@@ -5,6 +5,7 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use serde::*;
 use std::cell::{Cell, OnceCell, UnsafeCell};
 use std::collections::HashMap;
+use std::mem::DropGuard;
 use std::num::NonZero;
 use std::path::Path;
 use std::slice::from_raw_parts_mut;
@@ -109,6 +110,7 @@ struct ClientConfig {
     target_buffer_len: HashMap<u32, NonZero<u32>>,
     compat_buffer_dur_hns: HashMap<u32, i64>,
     force_period: bool,
+    period_offset: i32,
     mode: ClientMode,
     raw: bool,
 }
@@ -196,6 +198,43 @@ const KEYWORDS: &[&str] = &["[GAME]", "[SK]"];
 
 macro_rules! impl_boilerplate {
     (IAudioClient) => {
+        fn GetDevicePeriod(
+            &self,
+            phnsdefaultdeviceperiod: *mut i64,
+            phnsminimumdeviceperiod: *mut i64,
+        ) -> WinResult<()> {
+            info_tagged!(@self, "GetDevicePeriod called");
+            if self.info.config.force_period {
+                let mut minimumdeviceperiod = 0;
+                unsafe {
+                    self.inner
+                        .GetDevicePeriod(None, Some(&mut minimumdeviceperiod))?
+                };
+                if let Some(phnsdefaultdeviceperiod) = unsafe { phnsdefaultdeviceperiod.as_mut() } {
+                    let param = self.info.param(&self.inner)?;
+                    *phnsdefaultdeviceperiod = calculate_period(
+                        param.samplerate,
+                        param.current_period.saturating_add_signed(
+                            self.info
+                                .config
+                                .period_offset
+                                .saturating_mul(param.fundamental as i32),
+                        ),
+                    )
+                    .max(minimumdeviceperiod)
+                }
+                if let Some(phnsminimumdeviceperiod) = unsafe { phnsminimumdeviceperiod.as_mut() } {
+                    *phnsminimumdeviceperiod = minimumdeviceperiod
+                }
+                // just assume no one will be silly here
+                Ok(())
+            } else {
+                unsafe {
+                    self.inner
+                        .GetDevicePeriod(Some(phnsdefaultdeviceperiod), Some(phnsminimumdeviceperiod))
+                }
+            }
+        }
         fn GetMixFormat(&self) -> WinResult<*mut WAVEFORMATEX> {
             info_tagged!(@self, "GetMixFormat called");
             unsafe { self.inner.GetMixFormat() }
@@ -217,42 +256,44 @@ macro_rules! impl_boilerplate {
             unsafe { self.inner.GetStreamLatency() }
         }
     };
-    (IAudioClient2) =>
+    (IAudioClient2, $struct:ty) =>
     {
-        fn IsOffloadCapable(&self, category: AUDIO_STREAM_CATEGORY) -> WinResult<BOOL> {
-            info_tagged!(@self, "IsOffloadCapable called");
-            unsafe { self.inner.IsOffloadCapable(category) }
-        }
-        fn GetBufferSizeLimits(
-            &self,
-            pformat: *const WAVEFORMATEX,
-            beventdriven: BOOL,
-            phnsminbufferduration: *mut i64,
-            phnsmaxbufferduration: *mut i64,
-        ) -> WinResult<()> {
-            info_tagged!(@self, "GetBufferSizeLimits called");
-            unsafe {
-                self.inner.GetBufferSizeLimits(
-                    pformat,
-                    beventdriven.into(),
-                    phnsminbufferduration,
-                    phnsmaxbufferduration,
-                )
+        impl IAudioClient2_Impl for $struct {
+            fn IsOffloadCapable(&self, category: AUDIO_STREAM_CATEGORY) -> WinResult<BOOL> {
+                info_tagged!(@self, "IsOffloadCapable called");
+                unsafe { self.inner.IsOffloadCapable(category) }
             }
-        }
-        fn SetClientProperties(&self, pproperties: *const AudioClientProperties) -> WinResult<()> {
-            info_tagged!(@self, "SetClientProperties called");
-            unsafe {
-                self.inner.SetClientProperties(if self.info.config.raw {
-                    let mut option = *pproperties;
-                    self.info.raw_flag.call_once(|| {
-                        info_tagged!(@self, "Applying raw flag");
-                    });
-                    option.Options |= AUDCLNT_STREAMOPTIONS_RAW;
-                    &option
-                } else {
-                    pproperties
-                })
+            fn GetBufferSizeLimits(
+                &self,
+                pformat: *const WAVEFORMATEX,
+                beventdriven: BOOL,
+                phnsminbufferduration: *mut i64,
+                phnsmaxbufferduration: *mut i64,
+            ) -> WinResult<()> {
+                info_tagged!(@self, "GetBufferSizeLimits called");
+                unsafe {
+                    self.inner.GetBufferSizeLimits(
+                        pformat,
+                        beventdriven.into(),
+                        phnsminbufferduration,
+                        phnsmaxbufferduration,
+                    )
+                }
+            }
+            fn SetClientProperties(&self, pproperties: *const AudioClientProperties) -> WinResult<()> {
+                info_tagged!(@self, "SetClientProperties called");
+                unsafe {
+                    self.inner.SetClientProperties(if self.info.config.raw {
+                        let mut option = *pproperties;
+                        self.info.raw_flag.call_once(|| {
+                            info_tagged!(@self, "Applying raw flag");
+                        });
+                        option.Options |= AUDCLNT_STREAMOPTIONS_RAW;
+                        &option
+                    } else {
+                        pproperties
+                    })
+                }
             }
         }
     };
@@ -304,7 +345,6 @@ unsafe fn check_thread() -> bool {
     unsafe {
         let name = GetThreadDescription(GetCurrentThread());
         let result = if let Ok(thread_desc) = name
-            && !thread_desc.is_empty()
             && let Ok(name) = thread_desc.to_string()
             && KEYWORDS.iter().any(|keyword| name.contains(keyword))
         {
@@ -313,7 +353,7 @@ unsafe fn check_thread() -> bool {
         } else {
             false
         };
-        LocalFree(name.map(|p| HLOCAL(p.as_ptr().cast())).ok());
+        HLOCAL(name.unwrap_or_default().as_ptr().cast()).free();
         result
     }
 }
@@ -342,7 +382,7 @@ unsafe extern "system" fn hooked_activate(
         let iid = *riid;
         info!("Device::Activate called, iid: {iid:?}");
         let this_ref = IMMDevice::assume_init_ref(&this);
-        let ret = match iid {
+        match iid {
             IAudioClient::IID | IAudioClient2::IID | IAudioClient3::IID => {
                 let spawn_client = || -> WinResult<IAudioClient3> {
                     let mut result = std::ptr::null_mut();
@@ -355,7 +395,7 @@ unsafe extern "system" fn hooked_activate(
                     )
                     .and_then(|| IAudioClient3::from_abi(result))
                 };
-                let hr = (|| -> WinResult<IAudioClient3> {
+                (|| -> WinResult<IAudioClient3> {
                     let inner = spawn_client()?;
                     let dataflow = this_ref.cast::<IMMEndpoint>()?.GetDataFlow()?.into();
                     let config = CONFIG.get(dataflow);
@@ -393,12 +433,10 @@ unsafe extern "system" fn hooked_activate(
                         }
                     })
                 })()
-                .map_or_else(|e| e.code(), |proxy| proxy.query(riid, ppinterface));
-                hr
+                .map_or_else(|e| e.code(), |proxy| proxy.query(riid, ppinterface))
             }
             _ => orig(this, riid, dwclsctx, pactivationparams, ppinterface),
-        };
-        ret
+        }
     }
 }
 
@@ -433,18 +471,17 @@ struct Shared3Info {
 impl Shared3Info {
     fn init(inner: &IAudioClient3, config: &ClientConfig, tag: &str) -> WinResult<Self> {
         let mut periods = [0; 4];
-        let pformat = unsafe { inner.GetMixFormat()? };
-        let samplerate = unsafe { *pformat }.nSamplesPerSec;
+        let pformat =
+            unsafe { DropGuard::new(inner.GetMixFormat()?, |pf| CoTaskMemFree(Some(pf.cast()))) };
+        let samplerate = unsafe { **pformat }.nSamplesPerSec;
         unsafe {
-            inner
-                .GetSharedModeEnginePeriod(
-                    pformat,
-                    &mut periods[0],
-                    &mut periods[1],
-                    &mut periods[2],
-                    &mut periods[3],
-                )
-                .and(Ok(CoTaskMemFree(Some(pformat.cast()))))? // it eagers for free
+            inner.GetSharedModeEnginePeriod(
+                *pformat,
+                &mut periods[0],
+                &mut periods[1],
+                &mut periods[2],
+                &mut periods[3],
+            )?
         };
         let current_period = if config.target_period_hus != 0 {
             calculate_buffer(samplerate, periods[1], config.target_period_hus)
@@ -454,9 +491,10 @@ impl Shared3Info {
         };
         info_tagged!(
             tag,
-            "Period: Current = {current_period}, Min = {}, Max = {}, Samplerate = {samplerate}",
+            "Period: Current = {current_period}, Min = {}, Max = {}, Fundamental = {}, Samplerate = {samplerate}",
             periods[2],
-            periods[3]
+            periods[3],
+            periods[1]
         );
         Ok(Self {
             current_period,
@@ -541,38 +579,6 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
         }
     }
 
-    fn GetDevicePeriod(
-        &self,
-        phnsdefaultdeviceperiod: *mut i64,
-        phnsminimumdeviceperiod: *mut i64,
-    ) -> WinResult<()> {
-        info_tagged!(@self, "GetDevicePeriod called");
-        if self.info.initialized() || self.info.config.force_period {
-            let mut minimumdeviceperiod = 0;
-            unsafe {
-                self.inner
-                    .GetDevicePeriod(None, Some(&mut minimumdeviceperiod))?
-            };
-            if let Some(phnsdefaultdeviceperiod) = unsafe { phnsdefaultdeviceperiod.as_mut() } {
-                *phnsdefaultdeviceperiod = calculate_period(
-                    self.info.param(&self.inner)?.samplerate,
-                    self.info.param(&self.inner)?.current_period,
-                )
-                .max(minimumdeviceperiod)
-            }
-            if let Some(phnsminimumdeviceperiod) = unsafe { phnsminimumdeviceperiod.as_mut() } {
-                *phnsminimumdeviceperiod = minimumdeviceperiod
-            }
-            // just assume no one will be silly here
-            Ok(())
-        } else {
-            unsafe {
-                self.inner
-                    .GetDevicePeriod(Some(phnsdefaultdeviceperiod), Some(phnsminimumdeviceperiod))
-            }
-        }
-    }
-
     fn GetBufferSize(&self) -> WinResult<u32> {
         if self.info.initialized() {
             let real_size = unsafe { self.inner.GetBufferSize()? };
@@ -623,9 +629,7 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
     }
 }
 
-impl IAudioClient2_Impl for RedirectAudioClient_Impl {
-    impl_boilerplate!(IAudioClient2);
-}
+impl_boilerplate!(IAudioClient2, RedirectAudioClient_Impl);
 
 impl IAudioClient3_Impl for RedirectAudioClient_Impl {
     impl_boilerplate!(IAudioClient3);
@@ -732,18 +736,6 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
         }
     }
 
-    fn GetDevicePeriod(
-        &self,
-        phnsdefaultdeviceperiod: *mut i64,
-        phnsminimumdeviceperiod: *mut i64,
-    ) -> WinResult<()> {
-        info_tagged!(@self, "GetDevicePeriod called");
-        unsafe {
-            self.inner
-                .GetDevicePeriod(Some(phnsdefaultdeviceperiod), Some(phnsminimumdeviceperiod))
-        }
-    }
-
     fn GetBufferSize(&self) -> WinResult<u32> {
         let buf = unsafe { self.inner.GetBufferSize()? };
         info_tagged!(@self, "GetBufferSize called, buffer length: {buf}");
@@ -843,9 +835,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
     }
 }
 
-impl IAudioClient2_Impl for RedirectCompatAudioClient_Impl {
-    impl_boilerplate!(IAudioClient2);
-}
+impl_boilerplate!(IAudioClient2, RedirectCompatAudioClient_Impl);
 
 impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
     impl_boilerplate!(IAudioClient3);
@@ -898,7 +888,7 @@ impl RedirectCompatAudioRenderClient {
         let read_len = self.align.frames_to_bytes(len as usize);
         unsafe {
             let slice_to_write = from_raw_parts_mut(self.inner.GetBuffer(len)?, read_len);
-            let slice = &self.trick_buffer.get().as_ref_unchecked()[..read_len];
+            let slice = &self.trick_buffer.as_ref_unchecked()[..read_len];
             slice_to_write.copy_from_slice(slice);
             self.inner.ReleaseBuffer(len, dwflags)
         }
@@ -911,7 +901,7 @@ impl IAudioRenderClient_Impl for RedirectCompatAudioRenderClient_Impl {
                 self.tag,
                 "GetBuffer called, requested: {numframesrequested}"
             );
-            Ok(unsafe { self.trick_buffer.get().as_mut_unchecked().as_mut_ptr() })
+            Ok(unsafe { self.trick_buffer.as_mut_unchecked().as_mut_ptr() })
         } else {
             unsafe { self.inner.GetBuffer(numframesrequested) }
         }
@@ -1014,37 +1004,6 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
         }
     }
 
-    fn GetDevicePeriod(
-        &self,
-        phnsdefaultdeviceperiod: *mut i64,
-        phnsminimumdeviceperiod: *mut i64,
-    ) -> WinResult<()> {
-        info_tagged!(@self, "GetDevicePeriod called");
-        if self.info.initialized() || self.info.config.force_period {
-            let mut minimumdeviceperiod = 0;
-            unsafe {
-                self.inner
-                    .GetDevicePeriod(None, Some(&mut minimumdeviceperiod))?
-            };
-            if let Some(phnsdefaultdeviceperiod) = unsafe { phnsdefaultdeviceperiod.as_mut() } {
-                let param = self.info.param(&self.inner)?;
-                self.set_buffer(param);
-                *phnsdefaultdeviceperiod =
-                    calculate_period(param.samplerate, self.buffer.get()).max(minimumdeviceperiod)
-            }
-            if let Some(phnsminimumdeviceperiod) = unsafe { phnsminimumdeviceperiod.as_mut() } {
-                *phnsminimumdeviceperiod = minimumdeviceperiod
-            }
-            // just assume no one will be silly here
-            Ok(())
-        } else {
-            unsafe {
-                self.inner
-                    .GetDevicePeriod(Some(phnsdefaultdeviceperiod), Some(phnsminimumdeviceperiod))
-            }
-        }
-    }
-
     fn GetBufferSize(&self) -> WinResult<u32> {
         if self.info.initialized() {
             let buf = self.buffer.get();
@@ -1059,7 +1018,7 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
         trace_tagged!(@self, "GetCurrentPadding called");
         if let Some((outer, _)) = self.outer.get() {
             let outer: &RedirectRingbufAudioRenderClient = unsafe { outer.as_impl() };
-            let buf = unsafe { outer.buffer.get().as_ref_unchecked() };
+            let buf = unsafe { outer.buffer.as_ref_unchecked() };
             let len = self.buffer.get();
             Ok(if buf.is_full() {
                 len
@@ -1189,9 +1148,7 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
     }
 }
 
-impl IAudioClient2_Impl for RedirectRingbufAudioClient_Impl {
-    impl_boilerplate!(IAudioClient2);
-}
+impl_boilerplate!(IAudioClient2, RedirectRingbufAudioClient_Impl);
 
 impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
     impl_boilerplate!(IAudioClient3);
@@ -1250,7 +1207,7 @@ impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
         Ok(())
     }
     fn Invoke(&self, pasyncresult: Ref<IRtwqAsyncResult>) -> WinResult<()> {
-        let buffer = unsafe { self.buffer.get().as_mut_unchecked() };
+        let buffer = unsafe { self.buffer.as_mut_unchecked() };
         if likely_stable::unlikely(buffer.is_abandoned()) {
             return Ok(());
         } else {
@@ -1324,7 +1281,7 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
                 "GetBuffer called, requested: {numframesrequested}"
             );
         }
-        Ok(unsafe { self.cache.get().as_mut_unchecked() }.as_mut_ptr())
+        Ok(unsafe { self.cache.as_mut_unchecked().as_mut_ptr() })
     }
     fn ReleaseBuffer(&self, numframeswritten: u32, dwflags: u32) -> WinResult<()> {
         if numframeswritten == 0 {
@@ -1341,8 +1298,8 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
             }
         }
         unsafe {
-            let buffer = self.buffer.get().as_mut_unchecked();
-            let slice = &mut self.cache.get().as_mut_unchecked()
+            let buffer = self.buffer.as_mut_unchecked();
+            let slice = &mut self.cache.as_mut_unchecked()
                 [..(self.align.frames_to_bytes(numframeswritten as usize))];
             if likely_stable::unlikely(dwflags == 2) {
                 slice.fill(0);
@@ -1360,7 +1317,7 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
 }
 impl Drop for RedirectRingbufAudioRenderClient {
     fn drop(&mut self) {
-        info_tagged!(self.tag, "Stopping consumer thread");
+        info_tagged!(self.tag, "Producer thread dropped");
     }
 }
 
@@ -1369,20 +1326,23 @@ fn formatter(
     _: &mut DeferredNow,
     record: &Record,
 ) -> std::io::Result<()> {
-    write!(w, "{} [{}] ", record.level(), record.target())?;
-    write!(w, "{}", record.args())
+    write!(
+        w,
+        "{} [{}] {}",
+        record.level(),
+        record.target(),
+        record.args()
+    )
 }
 
 fn get_device() -> WinResult<IMMDevice> {
     unsafe {
-        let collection = {
-            let mut factory = std::ptr::null_mut();
-            DllGetClassObject(&MMDeviceEnumerator, &IClassFactory::IID, &mut factory)
-                .and_then(|| IClassFactory::from_abi(factory))
-        }?
-        .CreateInstance::<_, IMMDeviceEnumerator>(None)?
-        .EnumAudioEndpoints(EDataFlow(2), DEVICE_STATE(1))?;
-        collection.Item(0)
+        let mut factory = std::ptr::null_mut();
+        DllGetClassObject(&MMDeviceEnumerator, &IClassFactory::IID, &mut factory)
+            .and_then(|| IClassFactory::from_abi(factory))?
+            .CreateInstance::<_, IMMDeviceEnumerator>(None)?
+            .EnumAudioEndpoints(EDataFlow(2), DEVICE_STATE(1))?
+            .Item(0)
     }
 }
 
@@ -1413,6 +1373,7 @@ extern "system" fn setup(_: *mut c_void) -> u32 {
     }
     .start()
     .expect("unable to setup logger");
+    _ = LOGGER_HANDLE.set(handle);
     info!(
         "Attempting to load config from working directory: {}",
         std::env::current_dir().map_or_else(
@@ -1430,7 +1391,11 @@ extern "system" fn setup(_: *mut c_void) -> u32 {
         }
     }
     unsafe {
-        _ = CoInitializeEx(None, COINIT(0));
+        let _guard = DropGuard::new(CoInitializeEx(None, COINIT(0)), |hr| {
+            if hr.is_ok() {
+                CoUninitialize()
+            }
+        });
         let mut session = neohook::DetourTransaction::begin();
         if let Ok(device) = get_device() {
             ACTIVATE = session
@@ -1443,9 +1408,7 @@ extern "system" fn setup(_: *mut c_void) -> u32 {
             error!("Failed to get default device, skipping hook");
             session.abort();
         }
-        CoUninitialize();
     }
-    _ = LOGGER_HANDLE.set(handle);
     0
 }
 

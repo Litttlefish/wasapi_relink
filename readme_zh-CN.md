@@ -146,13 +146,17 @@ target_period_hus = 20
 target_buffer_len.48000 = 256
 # (通用) 为此流启用原始处理 (bool)。
 raw = true
-# (通用) 在初始化前报告修改后的周期长度(如果程序真的请求了周期的话)。
+# (通用) 在 GetDevicePeriod 中报告配置周期（基于 current_period 与 period_offset）。
+# false 时直接转发底层值。Bypass 模式下此项无效。
 force_period = true
+# (通用) 在 current_period 基础上，以 fundamental 的倍数为单位偏移报告周期，具体用法见下文。
+# 仅影响 GetDevicePeriod 的报告值，不改变实际流的周期。
+period_offset = 0
 
 [playback]
 
 # 运行模式，可用的模式有：Normal, Compat, Ringbuf, Bypass
-mode = "Ringbuf"
+mode = "Normal"
 
 # (Ringbuf 模式专用，可选) 为对应的采样率规定环形缓冲区尺寸（单位为帧）。
 # 这个数值会自动向上取整到以硬件周期帧数为单位的值。
@@ -187,7 +191,9 @@ compat_buffer_dur_hns.96000 = 238350 # 只有96khz采样率下生效
 
   - `raw` (bool): 表示此流是否使用**原始音频流**，该模式下会绕过绝大多数APO。`Bypass` 模式下此项无效。
 
-  - `force_period` (bool): 会在 `Initialize` 前的 `GetDevicePeriod` 调用里返回修改后的周期。`Bypass` 模式下此项无效。
+  - `force_period` (bool): 在 `GetDevicePeriod` 中向 `phnsdefaultdeviceperiod` 报告配置的周期（基于 `current_period` 与 `period_offset` 计算得出），而非原始值。仅影响应用看到的设备周期，不改变实际流的周期，值为 `false` 时直接转发。`Bypass` 模式下此项无效。
+
+  - `period_offset` (i32): 在 `target_period_hus` 计算得出的值的基础上，以 `fundamental` 的倍数为单位偏移 `GetDevicePeriod` 的报告值，正值加长周期，负值缩短。例如设备返回 `fundamental = 32`，计算得出 `current_period = 128`，配置为`period_offset = 1` 时报告值为 160 帧对应的周期。修改后的值仅保证不低于设备最小周期（`phnsminimumdeviceperiod`）。默认 `0`。
 
   - `ring_buffer_len.<samplerate>` (u32): 环形缓冲区的目标尺寸，单位为**音频帧**。**推荐在环缓模式下设置一个合理的值。**
     - 注：工具会自动将该数值向上取整至驱动基础周期的整数倍，以保证流畅播放。
@@ -239,6 +245,19 @@ compat_buffer_dur_hns.96000 = 238350 # 只有96khz采样率下生效
 compat_buffer_dur_hns.48000 = 127500
 compat_buffer_dur_hns.96000 = 250000  # 为 96kHz 指定一个值
 ```
+
+### 启用或关闭 `force_period` 后出现爆音/音频引擎故障（音游 / 依赖 `GetDevicePeriod` 的应用）
+
+**现象：** 音频能播放，但 key 音出现爆音或整个游戏完全无声。
+
+**原因：** 部分应用不使用 `GetBufferSize` 决定混音块大小，而是用 `GetDevicePeriod`
+推算 buffer 长度或混音周期（例如 `4 * default period`）。`force_period = true`
+报告的是配置周期（`current_period + period_offset`），如果这个值与应用的实际预期
+不匹配，应用会按错误的推断结果写入，导致不可预见的结果。
+
+**解决方案：** 先尝试切换 `force_period`，确定不会爆音的周期。然后在启用 `force_period` 时尝试通过 `period_offset` 微调报告周期，使其与应用的混音块
+（如 480 帧）对齐。例如日志显示应用按 480 帧写入、`current_period = 128`、
+`fundamental = 32` 时，`(480 - 128) / 32 = 11`，可尝试将 `period_offset` 设置为 11。
 
 ### 程序无法启动
 

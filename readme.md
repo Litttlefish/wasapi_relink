@@ -146,8 +146,12 @@ target_period_hus = 20
 target_buffer_len.48000 = 256
 # (General) Enable raw processing for this stream (bool).
 raw = true
-# (General) Report spoofed period before client initialize(if any).
+# (General) In GetDevicePeriod, report the configured period (based on current_period and period_offset).
+# When false, forward the underlying value directly. Does nothing in Bypass mode.
 force_period = true
+# (General) Offset the reported period by multiples of fundamental based on current_period; see details below.
+# Only affects the value reported by GetDevicePeriod; does not change the actual stream period.
+period_offset = 0
 
 [playback]
 
@@ -189,12 +193,14 @@ compat_buffer_dur_hns.96000 = 238350 # only works in 96khz
 
   - `raw` (bool): Indicates this stream to use **raw processing**, which bypasses most APO. Does nothing when mode is `Bypass`.
 
-  - `force_period` (bool): Will report spoofed period in `GetDevicePeriod` calls before `Initialize`. Does nothing when mode is `Bypass`.
+  - `force_period` (bool): Reports the configured period (calculated from `current_period` and `period_offset`) to `phnsdefaultdeviceperiod` in `GetDevicePeriod`, instead of the original value. This only affects the device period seen by the application and does not change the actual stream period; when `false`, the original value is forwarded directly. Does nothing when mode is `Bypass`.
+
+  - `period_offset` (i32): Offsets the value reported by `GetDevicePeriod` in units of `fundamental` multiples, based on the value calculated from `target_period_hus`. Positive values lengthen the period, negative values shorten it. For example, if the device returns `fundamental = 32` and the calculated `current_period = 128`, setting `period_offset = 1` reports the period corresponding to 160 frames. The modified value is only guaranteed not to be lower than the device minimum period (`phnsminimumdeviceperiod`). Default `0`.
 
   - `ring_buffer_len.<samplerate>` (u32): Target buffer length for the ring buffer in **audio frames**. **It's recommended to set a proper value in Ringbuf mode.**
     - Note: The tool will automatically round this value *UP* to the nearest multiple of fundamental period to ensure smooth streaming and prevent micro-glitches.
 
-  - `compat_buffer_dur_hns.<samplerate>` (i64): Target buffer size for shared stream in **units of 100 nanoseconds**. This controls the size of the shared buffer the program actually sees in Compat mode. The tool/Windows will default to the driver’s minimum if this is set too low or not specified. **This can help fix audio pops that occur after changing the audio sample rate in Compat mode.**
+  - `compat_buffer_dur_hns.<samplerate>` (i64): Target buffer size for the shared stream in **units of 100 nanoseconds**. In Compat mode, the program will only see the buffer size specified here. If set too low or not specified, the tool/Windows will set it to the driver minimum. **This can help fix audio pops after changing the sample rate in Compat mode.**
 
 ## Troubleshooting
 
@@ -242,6 +248,14 @@ compat_buffer_dur_hns.48000 = 127500
 compat_buffer_dur_hns.96000 = 250000  # Add a specific value for 96kHz
 ```
 
+### Pops / Audio Engine Failure after Enabling or Disabling `force_period` (Rhythm Games / Apps Relying on `GetDevicePeriod`)
+
+**Phenomenon:** Audio plays, but key sounds pop or the whole game is completely silent.
+
+**Cause:** Some applications do not use `GetBufferSize` to determine the mixing block size; instead, they use `GetDevicePeriod` to infer the buffer length or mixing period (e.g. `4 * default period`). `force_period = true` reports the configured period (`current_period + period_offset`). If this value does not match the application's actual expectation, the application will write according to an incorrect inference, causing unpredictable results.
+
+**Solution:** First try toggling `force_period` to find a period that does not pop. Then try fine-tuning the reported period via `period_offset` with `force_period` enabled to align it with the application's mixing block (e.g. 480 frames). For example, if the log shows the app writes in 480-frame blocks, `current_period = 128`, and `fundamental = 32`, then `(480 - 128) / 32 = 11`; try setting `period_offset` to 11.
+
 ### Program won't start at all
 
 **Phenomenon:** The target program fails to start after loading the DLL, and no log is given.
@@ -253,7 +267,7 @@ It commonly occurs when the target executable resides under `Program Files` or o
 For example:
 
 ```toml
-log_path = "C:\\Users\\Public\\wasapi_relink.log"
+log_path = "C:\\Users\\Public"
 ```
 
 If you don't need logging to file, you can also disable it with `only_log_stdout` :
