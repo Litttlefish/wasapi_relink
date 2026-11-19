@@ -21,7 +21,7 @@ log = "0.4.*"
 windows-core = "0.62"
 # windows-link = "0.100"
 # windows-implement = "0.100"
-flexi_logger = { version = "0.31.*", features = ["async"] }
+flexi_logger = { version = "0.32", features = ["async"] }
 serde = { version = "1.*", features = ["derive"] }
 toml = "1.*"
 # ringbuf = "0.*"

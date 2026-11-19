@@ -126,8 +126,8 @@ impl ClientConfig {
                 .max(l.get().next_multiple_of(info.fundamental))
         })
     }
-    fn compat_buf_len(&self, info: &Shared3Info) -> Option<i64> {
-        self.compat_buffer_dur_hns.get(&info.samplerate).copied()
+    fn compat_buf_len(&self, sample_rate: u32) -> Option<i64> {
+        self.compat_buffer_dur_hns.get(&sample_rate).copied()
     }
 }
 
@@ -211,14 +211,16 @@ macro_rules! impl_boilerplate {
                         .GetDevicePeriod(None, Some(&mut minimumdeviceperiod))?
                 };
                 if let Some(phnsdefaultdeviceperiod) = unsafe { phnsdefaultdeviceperiod.as_mut() } {
-                    let param = self.info.param(&self.inner)?;
+                    let pformat =
+                        unsafe { DropGuard::new(self.inner.GetMixFormat()?, |pf| CoTaskMemFree(Some(pf.cast()))) };
+                    let info = Shared3Info::calc(&self.inner, *pformat, self.info.config, &self.info.tag)?;
                     *phnsdefaultdeviceperiod = calculate_period(
-                        param.samplerate,
-                        param.current_period.saturating_add_signed(
+                        info.samplerate,
+                        info.current_period.saturating_add_signed(
                             self.info
                                 .config
                                 .period_offset
-                                .saturating_mul(param.fundamental as i32),
+                                .saturating_mul(info.fundamental as i32),
                         ),
                     )
                     .max(minimumdeviceperiod)
@@ -281,28 +283,26 @@ macro_rules! impl_boilerplate {
                 }
             }
             fn SetClientProperties(&self, pproperties: *const AudioClientProperties) -> WinResult<()> {
-                if self.info.initialized() {
+                if self.info.parameters.get().is_some() {
                     warn_tagged!(@self, "SetClientProperties called after init");
                     unsafe { self.inner.SetClientProperties(pproperties) }
-                } else {
-                    if pproperties.is_null() {
-                        match (self.info.config.raw, self.info.modified_prop.get()) {
-                            (true, prop) => unsafe {
-                                info_tagged!(@self, "Applying raw flag");
-                                self.inner.SetClientProperties(&prop.unwrap_or(PROPERTY))
-                            },
-                            (false, Some(prop)) => unsafe { self.inner.SetClientProperties(&prop) },
-                            (false, None) => Ok(()),
-                        }
-                    } else {
-                        info_tagged!(@self, "SetClientProperties called");
-                        let mut option = unsafe { *pproperties };
-                        if self.info.config.raw {
-                            option.Options |= AUDCLNT_STREAMOPTIONS_RAW
-                        }
-                        self.info.modified_prop.set(Some(option));
-                        Ok(())
+                } else if pproperties.is_null() {
+                    match (self.info.config.raw, self.info.modified_prop.get()) {
+                        (true, prop) => unsafe {
+                            info_tagged!(@self, "Applying raw flag");
+                            self.inner
+                                .SetClientProperties(&prop.map_or(PROPERTY, |mut f| {
+                                    f.Options |= AUDCLNT_STREAMOPTIONS_RAW;
+                                    f
+                                }))
+                        },
+                        (false, Some(prop)) => unsafe { self.inner.SetClientProperties(&prop) },
+                        (false, None) => Ok(()),
                     }
+                } else {
+                    info_tagged!(@self, "SetClientProperties called");
+                    self.info.modified_prop.set(Some(unsafe { *pproperties }));
+                    Ok(())
                 }
             }
         }
@@ -479,14 +479,17 @@ struct Shared3Info {
     fundamental: u32,
 }
 impl Shared3Info {
-    fn init(inner: &IAudioClient3, config: &ClientConfig, tag: &str) -> WinResult<Self> {
+    fn calc(
+        inner: &IAudioClient3,
+        format: *const WAVEFORMATEX,
+        config: &ClientConfig,
+        tag: &str,
+    ) -> WinResult<Self> {
         let mut periods = [0; 4];
-        let pformat =
-            unsafe { DropGuard::new(inner.GetMixFormat()?, |pf| CoTaskMemFree(Some(pf.cast()))) };
-        let samplerate = unsafe { **pformat }.nSamplesPerSec;
+        let samplerate = unsafe { *format }.nSamplesPerSec;
         unsafe {
             inner.GetSharedModeEnginePeriod(
-                *pformat,
+                format,
                 &mut periods[0],
                 &mut periods[1],
                 &mut periods[2],
@@ -515,11 +518,10 @@ impl Shared3Info {
 }
 
 struct RedirectClientInfo {
-    parameters: OnceCell<WinResult<Shared3Info>>,
+    parameters: OnceCell<Shared3Info>,
     modified_prop: Cell<Option<AudioClientProperties>>,
     config: &'static ClientConfig,
     tag: Box<str>,
-    initialized: Cell<bool>,
 }
 impl RedirectClientInfo {
     fn new(config: &'static ClientConfig, tag: Box<str>) -> Self {
@@ -528,17 +530,11 @@ impl RedirectClientInfo {
             modified_prop: None.into(),
             config,
             tag,
-            initialized: false.into(),
         }
     }
-    fn param(&self, inner: &IAudioClient3) -> WinResult<&Shared3Info> {
-        self.parameters
-            .get_or_init(|| Shared3Info::init(inner, self.config, &self.tag))
-            .as_ref()
-            .map_err(|e| e.clone())
-    }
-    fn initialized(&self) -> bool {
-        self.initialized.get()
+    fn init(&self, format: *const WAVEFORMATEX, inner: &IAudioClient3) -> WinResult<&Shared3Info> {
+        let i = Shared3Info::calc(inner, format, self.config, &self.tag)?;
+        Ok(self.parameters.get_or_init(|| i))
     }
 }
 
@@ -591,9 +587,8 @@ impl IAudioClient_Impl for RedirectAudioClient_Impl {
     }
 
     fn GetBufferSize(&self) -> WinResult<u32> {
-        if self.info.initialized() {
+        if let Some(param) = self.info.parameters.get() {
             let real_size = unsafe { self.inner.GetBufferSize()? };
-            let param = self.info.param(&self.inner)?;
             let buf = self
                 .info
                 .config
@@ -658,11 +653,10 @@ impl IAudioClient3_Impl for RedirectAudioClient_Impl {
             );
         }
         self.SetClientProperties(std::ptr::null())?;
-        self.info.initialized.set(true);
         unsafe {
             self.inner.InitializeSharedAudioStream(
                 streamflags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                self.info.param(&self.inner)?.current_period,
+                self.info.init(pformat, &self.inner)?.current_period,
                 pformat,
                 Some(audiosessionguid),
             )
@@ -712,7 +706,7 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
                 let calculated_dur = self
                     .info
                     .config
-                    .compat_buf_len(self.info.param(&self.inner)?)
+                    .compat_buf_len(unsafe { *pformat }.nSamplesPerSec)
                     .unwrap_or_default();
                 info_tagged!(
                     @self,
@@ -797,11 +791,10 @@ impl IAudioClient_Impl for RedirectCompatAudioClient_Impl {
         let iid = unsafe { *riid };
         debug_tagged!(@self, "GetService called, iid: {iid:?}");
         match iid {
-            IAudioRenderClient::IID if self.info.initialized() => {
+            IAudioRenderClient::IID if let Some(param) = self.info.parameters.get() => {
                 if let Some(client) = self.outer.get() {
                     unsafe { client.query(riid, ppv).ok() }
                 } else {
-                    let param = self.info.param(&self.inner)?;
                     let hooker_buffer_len = match (
                         unsafe { self.hooker.GetBufferSize().ok() },
                         self.info.config.target_buf_len(param),
@@ -867,10 +860,9 @@ impl IAudioClient3_Impl for RedirectCompatAudioClient_Impl {
             } else {
                 (&self.hooker, 0)
             };
-            self.info.initialized.set(true);
             client.InitializeSharedAudioStream(
                 flag,
-                self.info.param(&self.inner)?.current_period,
+                self.info.init(pformat, &self.inner)?.current_period,
                 pformat,
                 Some(audiosessionguid),
             )
@@ -1002,7 +994,7 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
     }
 
     fn GetBufferSize(&self) -> WinResult<u32> {
-        if self.info.initialized() {
+        if self.info.parameters.get().is_some() {
             let buf = self.buffer.get();
             info_tagged!(@self, "GetBufferSize called, buffer length: {buf}");
             Ok(buf)
@@ -1070,7 +1062,7 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
 
     fn SetEventHandle(&self, eventhandle: HANDLE) -> WinResult<()> {
         info_tagged!(@self, "SetEventHandle called");
-        if self.info.initialized() {
+        if self.info.parameters.get().is_some() {
             self.app_handle.set(Some(eventhandle));
             Ok(())
         } else {
@@ -1082,11 +1074,10 @@ impl IAudioClient_Impl for RedirectRingbufAudioClient_Impl {
         let iid = unsafe { *riid };
         debug_tagged!(@self, "GetService called, iid: {iid:?}");
         match iid {
-            IAudioRenderClient::IID if self.info.initialized() => {
+            IAudioRenderClient::IID if let Some(param) = self.info.parameters.get() => {
                 if let Some((client, _)) = self.outer.get() {
                     unsafe { client.query(riid, ppv).ok() }
                 } else {
-                    let param = self.info.param(&self.inner)?;
                     let align = self.align.get();
                     let buffer = align.frames_to_bytes(self.buffer.get() as usize);
                     let event_handle = unsafe { CreateEventW(None, false, false, None)? };
@@ -1155,13 +1146,12 @@ impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
             );
         }
         self.SetClientProperties(std::ptr::null())?;
-        self.info.initialized.set(true);
         unsafe {
-            let param = self.info.param(&self.inner)?;
+            let param = self.info.init(pformat, &self.inner)?;
             self.buffer.set(
                 self.info
                     .config
-                    .ring_buf_len(param)
+                    .ring_buf_len(&param)
                     .unwrap_or_else(|| param.current_period * 10),
             );
             self.align.set(AudioAlign::new((*pformat).nBlockAlign));
