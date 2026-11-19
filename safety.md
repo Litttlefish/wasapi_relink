@@ -8,7 +8,7 @@
 
 DllMain中不应该做的事(个人总结版): 开启/安排任何常规线程, `LoadLibrary*` 函数加载或用 `GetModuleHandleEx` 中会修改引用计数的参数获取除自身之外的HANDLE
 
-不能开常规线程是因为这个线程会在DllMain里再触发一轮 THREAD_ATTACH 的DllMain，二者要是有关联就会互相锁死，没有关联也可能有竟态，不过破局方法就是用ntdll的`NtCreateThreadEx`开一个会跳过 THREAD_ATTACH 的线程就行（
+不能开常规线程是因为这个线程会在DllMain里再触发一轮 THREAD_ATTACH 的DllMain，二者要是有关联就会互相锁死，没有关联也可能有竟态，不过破局方法就是用ntdll的`NtCreateThreadEx`开一个会跳过 THREAD_ATTACH 的线程就行，这个线程会被阻塞到DllMain完成后才开始执行，同时解除了竟态和重入互锁
 
 而初始化线程里除了自己引入的`MMDevApi.dll`外什么都没有，完全没有引用计数问题（
 
@@ -36,7 +36,8 @@ compat和ringbuf中,尤其是ringbuf里对异步线程强行使用了as_impl,这
 
 1. 先写一个pause,它是原子的,所以这个操作本身安全
 2. Stop内会自旋等消费线程的确认信息，下次执行时线程就会读到暂停请求并写回确认
-3. 然后调用inner的Stop,此时应用线程还在阻塞，而IAudioClient::Stop不会停止回调，此后线程就只会进行空操作了，顺便省掉了可能的再次start时的卡启动问题
+3. 然后调用inner的Stop,此时应用线程还在阻塞，而IAudioClient::Stop不会停止回调，完成后线程就只会进行空操作了，顺便省掉了可能的再次start时的卡启动问题
+4. 二者读取和写入的字段完全不同，一个是abandoned标志，另一个是数据和head/tail位置，没有重合
 
 哪怕内部调用Stop时异步线程正在Get/Release写入(虽然时序上也不可能),基于wasapi的原则,此时也只是底层不再消费,写入依旧是安全的,仍然可以跑完流程后开睡
 
