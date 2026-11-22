@@ -8,7 +8,11 @@ English | [中文](./readme_zh-CN.md)
 
 Many applications and games use WASAPI's Shared mode for audio playback. While it offers good compatibility, this mode only allows for a minimum buffer size of 10ms, preventing further improvement in latency.
 
+On Windows, some legacy games/apps still use DirectSound or even MCI (e.g., `mciSendString`). They do not use WASAPI directly, so a hook module that only intercepts the WASAPI COM activation chain cannot handle them directly. Modernizing them for low latency often requires compatibility layers such as [DSOAL](https://github.com/kcat/dsoal) to route audio requests to the OpenAL Soft backend, or modifying the app's own audio implementation (usually only feasible for the developer).
+
 `wasapi_relink` intercepts the application's audio requests and forces them to use much smaller buffers by leveraging the `IAudioClient3` interface, achieving a low-latency experience similar to Exclusive mode without sacrificing Shared mode's convenience.
+
+Thanks to the choice of hook entry point, this module no longer intercepts upper-layer COM activation calls. Instead, it performs an inline hook directly at MMDevAPI's `IMMDevice::Activate`, the low-level audio client activation entry. The WASAPI compatibility layer that Windows provides for legacy audio APIs also eventually goes through this entry, so requests from legacy audio stacks such as DirectSound and MCI are automatically captured by the same hook chain. Currently, the DirectSound path has been verified to be covered automatically; in theory, other legacy audio stacks that land through this compatibility layer can also be brought into the low-latency modification scope without extra adaptation.
 
 ### Reminder: Your Driver is Everything
 
@@ -98,6 +102,12 @@ All silent data before `Start()` will be discarded.
 
 **Method:** `wasapi_relink` no longer wraps client. Instead, it directly returns `IAudioClient3`.
 
+### Coverage: Why Legacy Audio Stacks Are Also Captured Automatically
+
+Earlier versions intercepted `combase.dll!CoCreateInstance(Ex)` to return a wrapped `IAudioClient`. This path works for applications that call WASAPI directly, but it only covers cases where the application actively creates an audio client through the COM activation chain. Legacy audio APIs such as DirectSound and MCI do not go through this chain: they are routed to the Windows audio engine by the system's internal compatibility layer, and the application itself usually does not call `CoCreateInstance` to create an `IAudioClient`. Therefore, the old version's coverage of these legacy audio stacks was not stable.
+
+The current version moves the hook point down to MMDevAPI's `IMMDevice::Activate`. This is the common entry point for audio client activation: whether the upper layer calls WASAPI directly, is routed through the DirectSound compatibility layer, or an even older MCI / waveOut path eventually lands on the Windows audio engine, creating an audio client always goes through this entry.
+
 ## How to Use (Injection)
 
 This library **does not** include its own DLL injector. You must use an external tool or [stub generator](https://github.com/namazso/dll-proxy-generator).
@@ -156,7 +166,7 @@ period_offset = 0
 [playback]
 
 # Tool mode, available mode: Normal, Compat, Ringbuf, Bypass
-mode = "Ringbuf"
+mode = "Normal"
 
 # (Ringbuf mode exclusive, Optional) Assign a ring buffer length (in audio frames) to the corresponding samplerate.
 # The number will be automatically rounded UP to align with the driver's fundamental period for optimal performance.
@@ -358,18 +368,25 @@ Ringbuf mode inserts a high-performance software decoupler between the audio eng
 
 4. This wrapper chain continues all the way down to `IAudioRenderClient`, giving `wasapi_relink` full, transparent control over the entire audio stream lifecycle.
 
-### A Note on Capture (Microphone/Loopback) and Exclusive Mode
+The application side does not need to know that its audio requests have been taken over, and the system compatibility layer does not need any adaptation for `wasapi_relink`. As long as the audio stack eventually activates the device through `IMMDevice::Activate`, the module takes effect.
 
-In **Compat/Ringbuf Mode**, capture (mic) streams are simply forwarded. This *is* intentional:
+## A Note on Capture (Microphone/Loopback) and Exclusive Mode
 
-1. Mic latency is far less critical in Shared mode compared to effects or network latency. Due to the nature of capture streams, which don't require a silent pre-fill buffer in their interaction with the driver, triggering Windows' special behavior is by itself sufficient to reduce latency.
-2. Users with true low-latency input needs are already using `ASIO` or `WASAPI Exclusive` mode, which this tool does not target.
+In **Compat/Ringbuf Mode**, capture/loopback streams are simply forwarded. This *is* intentional:
 
-Additionally, Exclusive mode will error out in Compat mode and is forwarded in other modes; this is also intentional.
+1. In Shared mode, microphone latency is far less critical compared with effects or network latency.
+
+2. Due to the nature of capture devices and how applications interact with them (no silent prefill region is required), triggering Windows' special behavior is by itself sufficient to reduce latency.
+
+3. Users who truly need low-latency input are already using ASIO or WASAPI Exclusive mode, so they do not need this module.
+
+Additionally, Exclusive mode will error out in Compat mode and is forwarded as-is in other modes; this is also intentional:
+
+Compat mode maintains both an app-facing client and a low-latency client on the same device at the same time, while Exclusive mode requires the device to be exclusively held by a single stream; the two are inherently in conflict.
 
 ---
 
-### **Disclaimer:**
+## **Disclaimer:**
 
 This is an **experimental** and **educational** project.  
 

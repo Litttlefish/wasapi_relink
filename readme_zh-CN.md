@@ -6,9 +6,13 @@
 
 ## 目的
 
-许多应用程序和游戏使用 WASAPI 共享模式播放音频。虽然兼容性好，但此模式最小只能使用 10ms 的缓冲区，导致延迟表现无法继续改善。
+许多应用程序和游戏使用 WASAPI 共享模式播放音频。虽然兼容性好，但此模式最小只能使用 10ms 的硬件周期，导致延迟表现无法继续改善。
+
+此外，Windows 上仍有部分老游戏/应用使用 DirectSound 甚至 MCI（如 `mciSendString`） 等传统音频 API。它们并不直接使用 WASAPI，因此通常无法由仅拦截 WASAPI COM 激活链的 Hook 模块直接处理。想要对它们进行低延迟/现代化改造，往往需要借助 [DSOAL](https://github.com/kcat/dsoal) 等兼容层将音频请求转接到OpenAL Soft后端，或者直接修改应用自身的音频实现（通常只有开发者可行）。
 
 `wasapi_relink` 拦截应用程序的音频请求，并利用 `IAudioClient3` 接口强制它们使用更小的缓冲区，在不牺牲共享模式便利性的前提下，实现接近独占模式的低延迟体验。
+
+得益于 Hook 入口的选择，本模块不再拦截上层的 COM 激活调用，而是直接从 MMDevAPI 的 `IMMDevice::Activate` 这一底层音频客户端激活入口进行内联 Hook。Windows 为传统音频 API 提供的 WASAPI 兼容层最终也会经过这个入口，因此 DirectSound、MCI 等老式音频栈的请求会被同一条 Hook 链自动接管。当前实测 DirectSound 路径已可自动覆盖；理论上，其它经该兼容层落地的传统音频栈同样无需额外适配即可纳入低延迟改造范围。
 
 ### 注意：你的驱动非常重要
 
@@ -97,6 +101,12 @@ PS: 目前适配Low Latency Shared模式的声卡貌似并不多，目前最好�
 **目标：** 捕获流等用不到该工具修改的流。
 
 **方法：** `wasapi_relink` 将放弃返回包装类，直接给出底层的 `IAudioClient3` 。
+
+### 覆盖范围：为什么传统音频栈也会被自动接管
+
+早期版本通过拦截 `combase.dll!CoCreateInstance(Ex)` 来返回包装后的 `IAudioClient`。这条路径对直接调用 WASAPI 的应用有效，但它只覆盖“应用层主动通过 COM 激活链创建音频客户端”的情况。DirectSound、MCI 等传统音频 API 并不走这条链：它们由系统内部的兼容层转接到 Windows 音频引擎，应用本身通常不会调用 `CoCreateInstance` 去创建 `IAudioClient`。因此旧版对这些老式音频栈的覆盖并不稳定。
+
+当前版本把 Hook 点下移到了 `MMDevAPI` 的 `IMMDevice::Activate`。这是音频客户端激活的公共入口：无论上层是直接调用 WASAPI、经 DirectSound 兼容层转接，还是更老的 MCI / waveOut 路径最终落到 Windows 音频引擎，创建音频客户端时都要经过这个入口。
 
 ## 如何使用 (注入)
 
@@ -338,15 +348,20 @@ Windows 音频引擎对时序 *极其* 敏感。
 
 ### 实现：COM 原型方法的内联 hook
 
-`wasapi_relink` 不使用简单的 VTable 钩子。它虽然使用了VTable，但是是从原型函数处开始内联hook，保证不会漏过触发点。
+`wasapi_relink` 不使用简单的 VTable 钩子。它虽然借助 VTable 定位函数地址，但 Hook 的是 `IMMDevice::Activate` 的**原型函数本身**，而不是替换某个 `IMMDevice` 实例的 VTable 指针。
 
-1. 通过自身链接的`MMDevApi.dll`调用`DllGetClassObject`得到`IMMDeviceEnumerator`.
+这个区别对覆盖范围有直接影响：替换 VTable 只影响被替换的那个对象实例，而内联 Hook 原型函数会作用于所有经过该函数的调用路径，这同时包括了应用直接调用和系统兼容层内部转接的路径。
 
-2. 只要还存在活跃设备，这个原始`IMMDeviceEnumerator`就能通过调用链得到一个`IMMDevice`，并通过它的VTable找到`Activate`方法函数，对其进行内联hook。
+具体过程如下：
 
-3. 当应用后续使用`IMMDevice`时， `wasapi_relink` 会根据配置进行以下选择并返回包装过的 `IAudioClient` ：
+1. 通过自身链接的 `MMDevApi.dll` 调用 `DllGetClassObject` 得到 `IMMDeviceEnumerator`。
 
-    3.1. **兼容模式：** 执行兼容模式逻辑 (创建两个客户端) 并返回*一个*包装的 `IAudioClient` 。
+2. 通过这个原始 `IMMDeviceEnumerator` 枚举到一个活跃设备的 `IMMDevice`，
+   并借助 VTable 定位 `Activate` 方法，对其进行内联 hook。
+
+3. 当应用后续使用 `IMMDevice` 时，`wasapi_relink` 会根据配置进行以下选择并返回包装过的 `IAudioClient`：
+
+    3.1. **兼容模式：** 执行兼容模式逻辑 (创建两个客户端) 并返回*一个*包装的 `IAudioClient`。
 
     3.2. **普通模式：** 执行普通模式的逻辑，返回一个伪装成普通共享流的低延迟流。
 
@@ -354,14 +369,21 @@ Windows 音频引擎对时序 *极其* 敏感。
 
 4. 这条包装链一直延续到 `IAudioRenderClient`，使 `wasapi_relink` 能够完全、透明地控制整个音频流的生命周期。
 
+应用侧不需要知道自己的音频请求被接管，系统兼容层也无需为 `wasapi_relink` 做任何适配。只要音频栈最终通过 `IMMDevice::Activate` 激活设备，模块就会生效。
+
 ## 关于捕获 (麦克风/回环) 和独占模式的说明
 
-在**兼容/环缓模式**下，捕获流只会简单转发。这是*有意为之*：
+在**兼容/环缓模式**下，捕获/回环流只会简单转发。这是*有意为之*：
 
-1. 在共享模式下，与效果或网络延迟相比，麦克风延迟的重要性要低得多，并且基于捕获设备驱动和应用的交互原理（无需填充静默区），触发 Windows 特殊模式本身就已经能降低延迟了。
-2. 真正需要低延迟输入的用户都已经在用 ASIO 或 WASAPI 独占模式了，用不到 `wasapi_relink` 。
+1. 在共享模式下，与效果或网络延迟相比，麦克风延迟的重要性要低得多。
 
-此外，独占模式在兼容模式下会报错，其他模式下转发，这同样是有意为之。
+2. 并且基于捕获设备驱动和应用的交互原理（无需填充静默区），触发 Windows 特殊模式本身就已经能降低延迟了。
+
+3. 真正需要低延迟输入的用户都已经在用 ASIO 或 WASAPI 独占模式了，用不到本模块。
+
+此外，独占模式在兼容模式下会报错，其他模式下原样转发，这同样是有意为之：
+
+兼容模式会在同一设备上同时维持应用侧与低延迟两个客户端，而独占模式要求设备被单一流独占，两者天然冲突。
 
 ---
 
