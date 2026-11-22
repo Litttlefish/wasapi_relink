@@ -36,12 +36,14 @@ compat和ringbuf中,尤其是ringbuf里对异步线程强行使用了as_impl,这
 
 1. 先写一个pause,它是原子的,所以这个操作本身安全
 2. Stop内会自旋等消费线程的确认信息，下次执行时线程就会读到暂停请求并写回确认
-3. 然后调用inner的Stop,此时应用线程还在阻塞，而IAudioClient::Stop不会停止回调，完成后线程就只会进行空操作了，顺便省掉了可能的再次start时的卡启动问题
+3. 然后调用inner的Stop,此时应用线程还在阻塞，实际Stop还没有触发，而IAudioClient::Stop本身也不会停止回调（目前测试过的驱动皆如此），因此线程本身也不会被憋死，完成后线程就只会进行空操作了，顺便省掉了可能的再次start时的卡启动问题
 4. 二者读取和写入的字段完全不同，一个是abandoned标志，另一个是数据和head/tail位置，没有重合
 
 哪怕内部调用Stop时异步线程正在Get/Release写入(虽然时序上也不可能),基于wasapi的原则,此时也只是底层不再消费,写入依旧是安全的,仍然可以跑完流程后开睡
 
 应用去调用Reset时就自然保证了(只有一个)实际的独占访问，进而安全丢弃rtrb内容
+
+此外，完全停止时也是同理，因为线程持有IAudioClient3本身的一份引用，IAudioClient3包装又持有渲染/播放线程的引用，因此drop时大致顺序是先drop RedirectRingbufAudioRenderClient，然后drop RedirectRingbufThread，此时线程发现buffer abandoned了，线程自然就会停，然后名正言顺释放rtwq和IAudioClient3引用，再然后才是 RedirectRingbufAudioClient 本身，没有泄漏
 
 P.S.: 由于rtrb没有提供无条件丢弃元素的功能，这里实际的丢弃是将消费端剩下的所有内容写到IAudioRenderClient的cache里，二者尺寸一致，直接倒入不会溢出（
 
