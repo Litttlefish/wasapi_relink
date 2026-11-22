@@ -198,45 +198,44 @@ const KEYWORDS: &[&str] = &["[GAME]", "[SK]"];
 
 macro_rules! impl_boilerplate {
     (IAudioClient) => {
-        fn GetDevicePeriod(
-            &self,
-            phnsdefaultdeviceperiod: *mut i64,
-            phnsminimumdeviceperiod: *mut i64,
-        ) -> WinResult<()> {
-            info_tagged!(@self, "GetDevicePeriod called");
-            if self.info.config.force_period {
-                let mut minimumdeviceperiod = 0;
-                unsafe {
-                    self.inner
-                        .GetDevicePeriod(None, Some(&mut minimumdeviceperiod))?
-                };
-                if let Some(phnsdefaultdeviceperiod) = unsafe { phnsdefaultdeviceperiod.as_mut() } {
-                    let pformat =
-                        unsafe { DropGuard::new(self.inner.GetMixFormat()?, |pf| CoTaskMemFree(Some(pf.cast()))) };
-                    let info = Shared3Info::calc(&self.inner, *pformat, self.info.config, &self.info.tag)?;
-                    *phnsdefaultdeviceperiod = calculate_period(
-                        info.samplerate,
-                        info.current_period.saturating_add_signed(
-                            self.info
-                                .config
-                                .period_offset
-                                .saturating_mul(info.fundamental as i32),
-                        ),
-                    )
-                    .max(minimumdeviceperiod)
-                }
-                if let Some(phnsminimumdeviceperiod) = unsafe { phnsminimumdeviceperiod.as_mut() } {
-                    *phnsminimumdeviceperiod = minimumdeviceperiod
-                }
-                // just assume no one will be silly here
-                Ok(())
-            } else {
-                unsafe {
-                    self.inner
-                        .GetDevicePeriod(Some(phnsdefaultdeviceperiod), Some(phnsminimumdeviceperiod))
-                }
-            }
+    fn GetDevicePeriod(
+        &self,
+        phnsdefaultdeviceperiod: *mut i64,
+        phnsminimumdeviceperiod: *mut i64,
+    ) -> WinResult<()> {
+        let mut periods = [0; 2];
+        unsafe {
+            self.inner
+                .GetDevicePeriod(Some(&mut periods[0]), Some(&mut periods[1]))?
         }
+        if self.info.config.force_period {
+            let pformat = unsafe {
+                DropGuard::new(self.inner.GetMixFormat()?, |pf| {
+                    CoTaskMemFree(Some(pf.cast()))
+                })
+            };
+            let info = Shared3Info::calc(&self.inner, *pformat, self.info.config, None)?;
+            periods[0] = calculate_period(
+                info.samplerate,
+                info.current_period.saturating_add_signed(
+                    self.info
+                        .config
+                        .period_offset
+                        .saturating_mul(info.fundamental as i32),
+                ),
+            )
+            .max(periods[1])
+        }
+        info_tagged!(@self, "GetDevicePeriod called, default period = {} * 100ns, min period = {} * 100ns", periods[0], periods[1]);
+        if let Some(phnsdefaultdeviceperiod) = unsafe { phnsdefaultdeviceperiod.as_mut() } {
+            *phnsdefaultdeviceperiod = periods[0]
+        }
+        if let Some(phnsminimumdeviceperiod) = unsafe { phnsminimumdeviceperiod.as_mut() } {
+            *phnsminimumdeviceperiod = periods[1]
+        }
+        // just assume no one will be silly here
+        Ok(())
+    }
         fn GetMixFormat(&self) -> WinResult<*mut WAVEFORMATEX> {
             info_tagged!(@self, "GetMixFormat called");
             unsafe { self.inner.GetMixFormat() }
@@ -483,7 +482,7 @@ impl Shared3Info {
         inner: &IAudioClient3,
         format: *const WAVEFORMATEX,
         config: &ClientConfig,
-        tag: &str,
+        tag: Option<&str>,
     ) -> WinResult<Self> {
         let mut periods = [0; 4];
         let samplerate = unsafe { *format }.nSamplesPerSec;
@@ -502,13 +501,13 @@ impl Shared3Info {
         } else {
             periods[2]
         };
-        info_tagged!(
-            tag,
-            "Period: Current = {current_period}, Min = {}, Max = {}, Fundamental = {}, Samplerate = {samplerate}",
-            periods[2],
-            periods[3],
-            periods[1]
-        );
+        tag.inspect(|tag|info_tagged!(
+                tag,
+                "Period: Current = {current_period}, Min = {}, Max = {}, Fundamental = {}, Samplerate = {samplerate} Hz",
+                periods[2],
+                periods[3],
+                periods[1]
+            ));
         Ok(Self {
             current_period,
             samplerate,
@@ -533,7 +532,7 @@ impl RedirectClientInfo {
         }
     }
     fn init(&self, format: *const WAVEFORMATEX, inner: &IAudioClient3) -> WinResult<&Shared3Info> {
-        let i = Shared3Info::calc(inner, format, self.config, &self.tag)?;
+        let i = Shared3Info::calc(inner, format, self.config, Some(&self.tag))?;
         Ok(self.parameters.get_or_init(|| i))
     }
 }
@@ -1151,7 +1150,7 @@ impl IAudioClient3_Impl for RedirectRingbufAudioClient_Impl {
             self.buffer.set(
                 self.info
                     .config
-                    .ring_buf_len(&param)
+                    .ring_buf_len(param)
                     .unwrap_or_else(|| param.current_period * 10),
             );
             self.align.set(AudioAlign::new((*pformat).nBlockAlign));
@@ -1222,7 +1221,7 @@ impl IRtwqAsyncCallback_Impl for RedirectRingbufThread_Impl {
                 .pop_entire_slice(slice)
                 .unwrap_or_else(|e| error_tagged!(self.tag, "pop underflow! {e}"));
             unsafe { self.inner.ReleaseBuffer(write_len as u32, 0)? };
-            trace_tagged!(
+            debug_tagged!(
                 self.tag,
                 "data in mid-buffer: {read_len}, written: {write_len}"
             )
@@ -1236,7 +1235,7 @@ impl Drop for RedirectRingbufThread {
             _ = RtwqUnlockWorkQueue(self.thread_id);
             _ = RtwqShutdown();
         }
-        info_tagged!(self.tag, "Consumer thread stopped");
+        info_tagged!(self.tag, "Consumer dropped");
     }
 }
 
@@ -1297,7 +1296,7 @@ impl IAudioRenderClient_Impl for RedirectRingbufAudioRenderClient_Impl {
 }
 impl Drop for RedirectRingbufAudioRenderClient {
     fn drop(&mut self) {
-        info_tagged!(self.tag, "Producer thread dropped");
+        info_tagged!(self.tag, "Producer dropped");
     }
 }
 

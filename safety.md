@@ -43,7 +43,9 @@ compat和ringbuf中,尤其是ringbuf里对异步线程强行使用了as_impl,这
 
 应用去调用Reset时就自然保证了(只有一个)实际的独占访问，进而安全丢弃rtrb内容
 
-此外，完全停止时也是同理，因为线程持有IAudioClient3本身的一份引用，IAudioClient3包装又持有渲染/播放线程的引用，因此drop时大致顺序是先drop RedirectRingbufAudioRenderClient，然后drop RedirectRingbufThread，此时线程发现buffer abandoned了，线程自然就会停，然后名正言顺释放rtwq和IAudioClient3引用，再然后才是 RedirectRingbufAudioClient 本身，没有泄漏
+此外，完全停止时也是同理，因为线程持有IAudioClient3本身的一份引用，IAudioClient3包装又持有渲染/播放线程的引用，因为回调持有一份 IAudioClient3，所以 client 侧字段先 drop 也没问题，回调 drop 时才发现 buffer abandoned，然后释放 RTWQ 和那份 clone，真正的 client 此时才归零，再然后才是 RedirectRingbufAudioClient 本身，没有泄漏
+
+退出流程线程检查需要依赖一次唤醒，而这个来自停止后仍在触发的引擎事件（实测行为）
 
 P.S.: 由于rtrb没有提供无条件丢弃元素的功能，这里实际的丢弃是将消费端剩下的所有内容写到IAudioRenderClient的cache里，二者尺寸一致，直接倒入不会溢出（
 
