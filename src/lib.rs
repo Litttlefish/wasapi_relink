@@ -198,44 +198,44 @@ const KEYWORDS: &[&str] = &["[GAME]", "[SK]"];
 
 macro_rules! impl_boilerplate {
     (IAudioClient) => {
-    fn GetDevicePeriod(
-        &self,
-        phnsdefaultdeviceperiod: *mut i64,
-        phnsminimumdeviceperiod: *mut i64,
-    ) -> WinResult<()> {
-        let mut periods = [0; 2];
-        unsafe {
-            self.inner
-                .GetDevicePeriod(Some(&mut periods[0]), Some(&mut periods[1]))?
+        fn GetDevicePeriod(
+            &self,
+            phnsdefaultdeviceperiod: *mut i64,
+            phnsminimumdeviceperiod: *mut i64,
+        ) -> WinResult<()> {
+            let mut periods = [0; 2];
+            unsafe {
+                self.inner
+                    .GetDevicePeriod(Some(&mut periods[0]), Some(&mut periods[1]))?
+            }
+            if self.info.config.force_period {
+                let pformat = unsafe {
+                    DropGuard::new(self.inner.GetMixFormat()?, |pf| {
+                        CoTaskMemFree(Some(pf.cast()))
+                    })
+                };
+                let info = Shared3Info::calc(&self.inner, *pformat, self.info.config, None)?;
+                periods[0] = calculate_period(
+                    info.samplerate,
+                    info.current_period.saturating_add_signed(
+                        self.info
+                            .config
+                            .period_offset
+                            .saturating_mul(info.fundamental as i32),
+                    ),
+                )
+                .max(periods[1])
+            }
+            info_tagged!(@self, "GetDevicePeriod called, default period = {} * 100ns, min period = {} * 100ns", periods[0], periods[1]);
+            if let Some(phnsdefaultdeviceperiod) = unsafe { phnsdefaultdeviceperiod.as_mut() } {
+                *phnsdefaultdeviceperiod = periods[0]
+            }
+            if let Some(phnsminimumdeviceperiod) = unsafe { phnsminimumdeviceperiod.as_mut() } {
+                *phnsminimumdeviceperiod = periods[1]
+            }
+            // just assume no one will be silly here
+            Ok(())
         }
-        if self.info.config.force_period {
-            let pformat = unsafe {
-                DropGuard::new(self.inner.GetMixFormat()?, |pf| {
-                    CoTaskMemFree(Some(pf.cast()))
-                })
-            };
-            let info = Shared3Info::calc(&self.inner, *pformat, self.info.config, None)?;
-            periods[0] = calculate_period(
-                info.samplerate,
-                info.current_period.saturating_add_signed(
-                    self.info
-                        .config
-                        .period_offset
-                        .saturating_mul(info.fundamental as i32),
-                ),
-            )
-            .max(periods[1])
-        }
-        info_tagged!(@self, "GetDevicePeriod called, default period = {} * 100ns, min period = {} * 100ns", periods[0], periods[1]);
-        if let Some(phnsdefaultdeviceperiod) = unsafe { phnsdefaultdeviceperiod.as_mut() } {
-            *phnsdefaultdeviceperiod = periods[0]
-        }
-        if let Some(phnsminimumdeviceperiod) = unsafe { phnsminimumdeviceperiod.as_mut() } {
-            *phnsminimumdeviceperiod = periods[1]
-        }
-        // just assume no one will be silly here
-        Ok(())
-    }
         fn GetMixFormat(&self) -> WinResult<*mut WAVEFORMATEX> {
             info_tagged!(@self, "GetMixFormat called");
             unsafe { self.inner.GetMixFormat() }
@@ -425,7 +425,7 @@ unsafe extern "system" fn hooked_activate(
                     info_tagged!(tag, "Client created");
                     let info = RedirectClientInfo::new(config, tag.into());
                     Ok(match config.mode {
-                        ClientMode::Normal => RedirectAudioClient::new(inner, info).into(),
+                        ClientMode::Normal => RedirectAudioClient { inner, info }.into(),
                         ClientMode::Compat if dataflow == DeviceDataFlow::Playback => {
                             RedirectCompatAudioClient::new(inner, spawn_client()?, info).into()
                         }
@@ -543,11 +543,6 @@ struct RedirectAudioClient {
     info: RedirectClientInfo,
 }
 
-impl RedirectAudioClient {
-    fn new(inner: IAudioClient3, info: RedirectClientInfo) -> Self {
-        Self { inner, info }
-    }
-}
 impl IAudioClient_Impl for RedirectAudioClient_Impl {
     impl_boilerplate!(IAudioClient);
     fn Initialize(

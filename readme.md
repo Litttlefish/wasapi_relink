@@ -384,6 +384,12 @@ Additionally, Exclusive mode will error out in Compat mode and is forwarded as-i
 
 Compat mode maintains both an app-facing client and a low-latency client on the same device at the same time, while Exclusive mode requires the device to be exclusively held by a single stream; the two are inherently in conflict.
 
+## Known Limits
+
+This module will not function correctly with programs that use a fixed sample rate and rely exclusively on the built-in Windows resampling engine. If you need to use it with such a program, please manually adjust your system sample rate to match the value required by that program.
+
+For instance, *Counter-Strike 2* (CS2) currently requests an initial sample rate of 44100 Hz. Consequently, this module cannot initialize properly if the system is set to a different sample rate; you must adjust your system sample rate to 44,100 Hz to use it.
+
 ---
 
 ## **Disclaimer:**
